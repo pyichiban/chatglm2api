@@ -47,14 +47,15 @@ def test_sign_matches_capture_evidence():
 
 
 def test_build_headers_shape():
-    h = build_headers(token="T", cookie="chatglm_token=T", accept="text/event-stream")
+    h = build_headers(token="T", accept="text/event-stream")
     assert h["Authorization"] == "Bearer T"
-    assert h["Cookie"] == "chatglm_token=T"
     assert h["Accept"] == "text/event-stream"
     assert len(h["X-Nonce"]) == 32 and len(h["X-Timestamp"]) == 13
     assert len(h["X-Sign"]) == 32
     # 无 token 时不带 Authorization
     assert "Authorization" not in build_headers()
+    # ⚠️ 关键：build_headers **不得**设 Cookie 头（会覆盖 cookie jar，导致 40012）
+    assert "Cookie" not in h
 
 
 # ── 凭据 ─────────────────────────────────────────────────────
@@ -98,10 +99,10 @@ def test_credential_status_and_save(tmp_path):
     assert again.refresh_token == rt and again.access_token == cred.access_token
 
 
-def test_load_credential_env(monkeypatch):
+def test_load_credential_env(monkeypatch, tmp_path):
     monkeypatch.setenv("GLM_REFRESH_TOKEN", _fake_jwt(FAKE_JWT_PAYLOAD))
     monkeypatch.delenv("GLM_CREDENTIAL_FILE", raising=False)
-    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    monkeypatch.chdir(tmp_path)   # 避开仓库里的 glm_credential.json
     cred = load_credential()
     assert cred.source == "env" and cred.user_id == FAKE_JWT_PAYLOAD["uid"]
 
@@ -138,10 +139,25 @@ def test_client_headers_include_signed_fields():
     client = GlmClient(cred)
     h = client._headers("application/json, text/plain, */*")
     for k in ("X-Sign", "X-Nonce", "X-Timestamp", "X-Device-Id", "X-Request-Id", "Authorization",
-              "Cookie", "App-Name", "Origin"):
+              "App-Name", "Origin"):
         assert k in h, k
     assert h["X-Device-Id"] == FAKE_JWT_PAYLOAD["device_id"]   # 与 JWT 一致（PROTOCOL §1.2）
     assert len(h["X-Request-Id"]) == 32
+    assert "Cookie" not in h                                    # cookie 一律走 jar
+    client.close()
+
+
+def test_client_cookies_go_into_jar():
+    """凭据必须进 cookie jar（而非显式 Cookie 头），否则 WAF cookie 无法链路化。"""
+    cred = make_credential(refresh_token=_fake_jwt(FAKE_JWT_PAYLOAD))
+    cred.access_token = _fake_jwt({"exp": 4102444800})
+    client = GlmClient(cred)
+    jar = client.session.cookies.get_dict(domain="chatglm.cn", path="/")
+    assert jar["chatglm_refresh_token"] == cred.refresh_token
+    assert jar["chatglm_token"] == cred.access_token
+    assert jar["chatglm_user_id"] == cred.user_id
+    # WAF cookie 不在 jar 里也不应被误删，且绝不能来自「凭据额外 cookie」
+    assert not any(k.startswith(("ssxmod", "_c_", "_nb_")) for k in jar)
     client.close()
 
 
@@ -206,3 +222,76 @@ def test_iter_sse_data_handles_multiline_and_done():
                                    "data: [DONE]", "", "data: {\"b\":", "data: 2}", ""]))
     assert payloads == ['{"a":1}', '[DONE]', '{"b":\n2}']
     assert parse_frame("[DONE]") is None and parse_frame("{bad") is None
+
+
+# ── 风控瞬时拒绝（40012）退避重试 ─────────────────────────────
+class _FakeResp:
+    """模拟 requests.Response 的最小面。"""
+
+    def __init__(self, status_code: int, payload: dict | None = None, text: str = ""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text or json.dumps(self._payload)
+
+    def json(self) -> dict:
+        if self._payload is None:
+            raise ValueError("no json")
+        return self._payload
+
+    @property
+    def content(self) -> bytes:
+        return self.text.encode()
+
+    def close(self) -> None:
+        pass
+
+
+def _client():
+    cred = make_credential(refresh_token=_fake_jwt(FAKE_JWT_PAYLOAD))
+    cred.access_token = _fake_jwt({"exp": 4102444800})
+    return GlmClient(cred)
+
+
+def test_transient_40012_is_retried_then_succeeds(monkeypatch):
+    """40012 是瞬时拒绝：退避重试后必须拿到结果，而不是直接报错。"""
+    client = _client()
+    calls = []
+
+    def fake_request(method, url, **kw):
+        calls.append(1)
+        # 前两次瞬时拒绝，第三次成功（复现实测：退避到第 4 次成功）
+        if len(calls) < 3:
+            return _FakeResp(400, {"status": C.STATUS_TRANSIENT, "message": "bad request(40012)"})
+        return _FakeResp(200, {"status": 0, "result": {"ok": True}})
+
+    monkeypatch.setattr(client.session, "request", fake_request)
+    monkeypatch.setattr("glm2api.client.time.sleep", lambda *_: None)  # 不等真时间
+    assert client._json("POST", C.EP_CONV_LIST, body={"page": 1}) == {"ok": True}
+    assert len(calls) == 3
+    client.close()
+
+
+def test_transient_40012_exhausted_raises_distinct_error(monkeypatch):
+    """重试耗尽后必须抛可区分的 GlmTransientRejection（提示可稍后重试）。"""
+    from glm2api.errors import GlmTransientRejection
+    client = _client()
+    monkeypatch.setattr(client.session, "request",
+                        lambda *a, **k: _FakeResp(400, {"status": C.STATUS_TRANSIENT,
+                                                        "message": "bad request(40012)"}))
+    monkeypatch.setattr("glm2api.client.time.sleep", lambda *_: None)
+    with pytest.raises(GlmTransientRejection):
+        client._json("POST", C.EP_CONV_LIST, body={"page": 1}, retries=2)
+    client.close()
+
+
+def test_non_transient_error_not_retried(monkeypatch):
+    """普通业务错误不得触发重试（避免把「确定性失败」放大成 5 倍请求）。"""
+    client = _client()
+    calls = []
+    monkeypatch.setattr(client.session, "request",
+                        lambda *a, **k: (calls.append(1),
+                                         _FakeResp(200, {"status": 50001, "message": "param error"}))[1])
+    with pytest.raises(GlmUpstreamError):
+        client._json("POST", C.EP_CONV_LIST, body={"page": 1})
+    assert len(calls) == 1
+    client.close()

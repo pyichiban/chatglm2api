@@ -7,7 +7,7 @@
 from .client import GlmClient
 from .credential import Credential, load_credential, make_credential, save_credential
 from .errors import (GlmAuthError, GlmError, GlmRateLimitError, GlmStreamTruncated,
-                     GlmUpstreamError)
+                     GlmTransientRejection, GlmUpstreamError)
 from .sse import ChatAggregate
 
 __version__ = "0.1.0"
@@ -22,6 +22,7 @@ DEFAULT_MODEL = constants.DEFAULT_MODEL
 __all__ = [
     "GlmClient", "Credential", "load_credential", "make_credential", "save_credential",
     "GlmError", "GlmAuthError", "GlmRateLimitError", "GlmUpstreamError", "GlmStreamTruncated",
+    "GlmTransientRejection",
     "ChatAggregate", "BASE", "DEFAULT_ASSISTANT", "DEFAULT_MODEL", "constants",
     "__version__",
 ]

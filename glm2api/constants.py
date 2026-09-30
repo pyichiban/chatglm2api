@@ -47,3 +47,13 @@ USER_AGENT = (
 # 非流式请求的超时（连接 + 读取）。流式请求**刻意不设 timeout**（AGENTS.md R35）。
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 60
+
+# ── 风控瞬时拒绝（2026-09-30 实测）────────────────────────────
+# 清言走阿里云 WAF，POST 类接口（recent_list / assistant/stream / modify_title …）
+# 会以 HTTP 400 + 信封 status=40012 "bad request(40012)" 瞬时拒绝请求。
+# 实测：连发 10 次全失败 0/10；带 4s 间隔 2/6；指数退避到第 4 次成功。
+# 结论：**它是可重试的瞬时拒绝**，必须退避重试，不可当作永久失败。
+# 注意 GET 类接口（user/info、operation/detail）不受影响。
+STATUS_TRANSIENT = 40012
+MAX_RETRIES = 4          # 重试次数上限（含首次共 5 次请求）
+RETRY_BASE_DELAY = 1.0   # 退避基数（秒）：delay = base * 2**attempt * jitter

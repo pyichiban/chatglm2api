@@ -31,6 +31,14 @@ class GlmUpstreamError(GlmError):
         super().__init__(f"上游错误 HTTP {status}: {message}")
 
 
+class GlmTransientRejection(GlmUpstreamError):
+    """风控瞬时拒绝（HTTP 400 + status=40012）且已耗尽重试。
+
+    它**不是**永久失败：实测退避重试通常能成功（见 constants.STATUS_TRANSIENT）。
+    抛出这个类型意味着调用方可以过后重试，或降低请求频率。
+    """
+
+
 class GlmStreamTruncated(GlmError):
     """SSE 流在传输层被截断（读错误 / 半帧），而非上游正常收尾。
 

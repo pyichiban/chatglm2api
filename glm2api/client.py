@@ -8,15 +8,18 @@
 """
 
 import json
+import random
 import secrets
+import time
 from typing import Any, Iterator
 
 import requests
 
 from . import constants as C
 from .credential import Credential, save_credential
-from .errors import GlmAuthError, GlmRateLimitError, GlmStreamTruncated, GlmUpstreamError
-from .sign import build_headers
+from .errors import (GlmAuthError, GlmRateLimitError, GlmStreamTruncated, GlmTransientRejection,
+                     GlmUpstreamError)
+from .sign import build_headers, sign_now
 from .sse import ChatAggregate, ensure_finished, iter_sse_data, parse_frame
 
 JSON_ACCEPT = "application/json, text/plain, */*"
@@ -106,9 +109,13 @@ class GlmClient:
     """清言网页版私有接口客户端。一个实例对应一份凭据。"""
 
     def __init__(self, credential: Credential, *, base: str = C.BASE, verify: bool = True,
-                 proxies: dict | None = None):
+                 proxies: dict | None = None, max_retries: int | None = None,
+                 retry_base_delay: float | None = None):
         self.cred = credential
         self.base = base.rstrip("/")
+        # 风控瞬时拒绝（40012）的退避重试预算。批量调用时可调大；见 README §4.4。
+        self.max_retries = C.MAX_RETRIES if max_retries is None else max_retries
+        self.retry_base_delay = C.RETRY_BASE_DELAY if retry_base_delay is None else retry_base_delay
         # 非流式用的超时；流式请求会显式传 timeout=None 覆盖它（见 _stream_post）
         self.timeout = (C.CONNECT_TIMEOUT, C.READ_TIMEOUT)
         self.session = requests.Session()
@@ -116,6 +123,26 @@ class GlmClient:
             self.session.verify = False
         if proxies:
             self.session.proxies.update(proxies)
+        self._sync_cookies()
+
+    # ── Cookie ────────────────────────────────────────────────
+    def _sync_cookies(self) -> None:
+        """把当前凭据写入 session 的 cookie jar。
+
+        用 jar 而**不是**显式 Cookie 头：显式头会覆盖 jar，使服务端下发/轮转的
+        WAF cookie（acw_tc / cdn_sec_tc）无法带回下一次请求。清言走阿里云 WAF，
+        POST 类接口（recent_list / assistant/stream）依赖该 cookie 链路，
+        缺失时持续返回 40012 bad request（实测，见 README §4.4）。
+        这里只覆盖业务 cookie，不触碰 jar 里的 WAF cookie。
+        """
+        for k, v in (("chatglm_token", self.cred.access_token),
+                     ("chatglm_refresh_token", self.cred.refresh_token),
+                     ("chatglm_user_id", self.cred.user_id)):
+            self.session.cookies.pop(k, None)  # 先清旧的（含 .chatglm.cn 域），避免重复
+            if v:
+                self.session.cookies.set(k, v, domain="chatglm.cn", path="/")
+        for k, v in self.cred.extra_cookies.items():
+            self.session.cookies.set(k, v, domain="chatglm.cn", path="/")
 
     # ── 生命周期 ──────────────────────────────────────────────
     def close(self) -> None:
@@ -132,7 +159,7 @@ class GlmClient:
 
     # ── 请求底层 ──────────────────────────────────────────────
     def _headers(self, accept: str) -> dict[str, str]:
-        h = build_headers(token=self.cred.access_token, cookie=self.cred.as_cookie(), accept=accept)
+        h = build_headers(token=self.cred.access_token, accept=accept)
         if self.cred.device_id:
             h["X-Device-Id"] = self.cred.device_id  # 与 JWT.device_id 一致（PROTOCOL §1.2）
         h["X-Request-Id"] = secrets.token_hex(16)
@@ -141,17 +168,17 @@ class GlmClient:
     def _url(self, path: str) -> str:
         return self.base + path
 
-    def _request(self, method: str, path: str, *, body: Any = None, params: dict | None = None,
-                 accept: str = JSON_ACCEPT, auth_retry: bool = True) -> requests.Response:
-        """发一次带签名的请求；401/登录态失效时自动 refresh 并重试一次（自愈，不变量 19）。"""
+    def _raw_request(self, method: str, path: str, *, body: Any = None, params: dict | None = None,
+                     accept: str = JSON_ACCEPT) -> requests.Response:
+        """发一次带签名的请求（含 401 自愈重试），**不做风控退避**。"""
         self.ensure_token()
         resp = self.session.request(
             method, self._url(path), headers=self._headers(accept),
             data=json.dumps(body).encode() if body is not None else None,
             params=params, timeout=self.timeout,
         )
-        if auth_retry and resp.status_code == 401:
-            self.ensure_token(force=True)  # 本地 exp 未到但上游已作废，靠 401 触发自愈
+        if resp.status_code == 401:
+            self.ensure_token(force=True)  # 本地 exp 未到但上游已作废，靠 401 触发自愈（不变量 19）
             resp.close()
             resp = self.session.request(
                 method, self._url(path), headers=self._headers(accept),
@@ -160,10 +187,42 @@ class GlmClient:
             )
         return resp
 
+    @staticmethod
+    def _is_transient(resp: requests.Response) -> bool:
+        """HTTP 400 + 信封 status=40012 = 风控瞬时拒绝，可退避重试（实测，见 constants）。"""
+        if resp.status_code != 400:
+            return False
+        try:
+            return resp.json().get("status") == C.STATUS_TRANSIENT
+        except ValueError:
+            return False
+
+    def _request(self, method: str, path: str, *, body: Any = None, params: dict | None = None,
+                 accept: str = JSON_ACCEPT, retries: int | None = None) -> requests.Response:
+        """带风控退避重试的请求。
+
+        清言 POST 类接口会以 40012 瞬时拒绝；实测连发 10 次全失败、退避后成功，
+        所以这里必须退避重试而不是直接报错。GET 类接口不受影响（不会触发重试）。
+        """
+        retries = self.max_retries if retries is None else retries
+        for attempt in range(retries + 1):
+            resp = self._raw_request(method, path, body=body, params=params, accept=accept)
+            if attempt < retries and self._is_transient(resp):
+                resp.close()
+                # 指数退避 + 抖动，避免多客户端同频重试再次被拒
+                time.sleep(self._backoff(attempt))
+                continue
+            return resp
+        return resp  # pragma: no cover —— 循环必返回
+
+    def _backoff(self, attempt: int) -> float:
+        """指数退避 + 50%~150% 抖动。"""
+        return self.retry_base_delay * (2 ** attempt) * (0.5 + random.random())
+
     def _json(self, method: str, path: str, *, body: Any = None, params: dict | None = None,
-              auth_retry: bool = True) -> dict:
+              retries: int | None = None) -> dict:
         """发请求并解信封，返回 result。"""
-        resp = self._request(method, path, body=body, params=params, auth_retry=auth_retry)
+        resp = self._request(method, path, body=body, params=params, retries=retries)
         try:
             raw = resp.content
             payload = json.loads(raw.decode("utf-8", errors="replace"))
@@ -174,6 +233,10 @@ class GlmClient:
             raise GlmRateLimitError(f"被限流: {payload.get('message')}")
         if resp.status_code == 401:
             raise GlmAuthError(f"HTTP 401: {payload.get('message')}")
+        if payload.get("status") == C.STATUS_TRANSIENT:
+            raise GlmTransientRejection(
+                resp.status_code, f"风控瞬时拒绝（已退避重试 {retries or self.max_retries} 次仍失败）: "
+                                   f"{payload.get('message')}；稍后重试或降低请求频率")
         if resp.status_code >= 400:
             raise GlmUpstreamError(resp.status_code, str(payload.get("message") or "http error"),
                                    resp.text[:300])
@@ -192,11 +255,29 @@ class GlmClient:
         ⚠️ 上游**会同时轮换 refresh_token**（PROTOCOL §1.3 铁律 1）：
         必须把响应里的新 refresh_token 落盘，否则下次启动用旧值 → 账号失效。
         """
-        h = build_headers(token=self.cred.refresh_token, cookie=self._refresh_cookie(), accept=JSON_ACCEPT)
+        h = build_headers(token=self.cred.refresh_token, accept=JSON_ACCEPT)
         if self.cred.device_id:
             h["X-Device-Id"] = self.cred.device_id
         h["X-Request-Id"] = secrets.token_hex(16)
-        resp = self.session.post(self._url(C.EP_REFRESH), headers=h, data=b"{}", timeout=self.timeout)
+        # 刷新只用根凭据：access 可能已失效不可带；用独立 session 避免污染业务 jar
+        rs = requests.Session()
+        rs.verify = self.session.verify
+        rs.proxies = self.session.proxies
+        rs.cookies.set("chatglm_refresh_token", self.cred.refresh_token, domain="chatglm.cn", path="/")
+        if self.cred.user_id:
+            rs.cookies.set("chatglm_user_id", self.cred.user_id, domain="chatglm.cn", path="/")
+        try:
+            # 刷新接口同样会被风控瞬时拒绝（实测 40012），必须退避重试
+            for attempt in range(self.max_retries + 1):
+                h["X-Timestamp"], h["X-Nonce"], h["X-Sign"] = sign_now()  # 重试需换新签名
+                resp = rs.post(self._url(C.EP_REFRESH), headers=h, data=b"{}", timeout=self.timeout)
+                if attempt < self.max_retries and self._is_transient(resp):
+                    resp.close()
+                    time.sleep(self._backoff(attempt))
+                    continue
+                break
+        finally:
+            rs.close()
         if resp.status_code == 401 or resp.status_code == 403:
             raise GlmAuthError(f"refresh 被拒（HTTP {resp.status_code}）：refresh_token 可能已失效")
         try:
@@ -204,6 +285,9 @@ class GlmClient:
         except ValueError:
             raise GlmUpstreamError(resp.status_code, "refresh 响应不是 JSON", resp.text[:300]) from None
         res = payload.get("result") or {}
+        if payload.get("status") == C.STATUS_TRANSIENT:
+            raise GlmTransientRejection(resp.status_code,
+                                        f"refresh 被风控瞬时拒绝（已退避重试 {self.max_retries} 次）")
         if payload.get("status") != 0 or not res.get("access_token"):
             raise GlmAuthError(f"refresh 失败: status={payload.get('status')} {payload.get('message')}")
         if res.get("is_guest"):
@@ -215,18 +299,12 @@ class GlmClient:
         if res.get("user_id"):
             self.cred.user_id = res["user_id"]
         self.cred.absorb_jwt()
+        self._sync_cookies()  # 轮换后的新 access/refresh 同步进 jar
 
         # 落盘失败必须显式报错：内存与磁盘不一致时重启会拿已作废的 refresh token（不变量 20）
         if self.cred.source and self.cred.source != "env":
             save_credential(self.cred)
         return self.cred.access_token
-
-    def _refresh_cookie(self) -> str:
-        """刷新时只带根凭据相关 cookie（不需要 access）。"""
-        return "; ".join(f"{k}={v}" for k, v in (
-            ("chatglm_refresh_token", self.cred.refresh_token),
-            ("chatglm_user_id", self.cred.user_id),
-        ) if v)
 
     # ── 用户与模型 ────────────────────────────────────────────
     def user_info(self) -> dict:
@@ -348,17 +426,27 @@ class GlmClient:
                 if chunk:
                     yield chunk
 
-    def _stream_response(self, body: dict):
+    def _stream_response(self, body: dict, retries: int | None = None):
         """建立 SSE 连接并返回 response 上下文。
 
         ⚠️ 流式请求**必须不设 timeout**（AGENTS.md R35 实证：带超时会让长回答被掐断
         且无终止帧）。requests 的默认 timeout 即为 None，这里显式写明以防误改。
+
+        风控瞬时拒绝（40012）同样会命中流式接口，但这里**只在建连阶段退避重试**：
+        一旦 SSE 已开始输出就绝不能重试，否则会重复计费 / 产生重复消息。
         """
         self.ensure_token()
-        resp = self.session.post(
-            self._url(C.EP_CHAT), headers=self._headers(SSE_ACCEPT),
-            data=json.dumps(body).encode(), stream=True, timeout=None,  # ← 刻意不设超时
-        )
+        retries = self.max_retries if retries is None else retries
+        for attempt in range(retries + 1):
+            resp = self.session.post(
+                self._url(C.EP_CHAT), headers=self._headers(SSE_ACCEPT),
+                data=json.dumps(body).encode(), stream=True, timeout=None,  # ← 刻意不设超时
+            )
+            if attempt < retries and self._is_transient(resp):
+                resp.close()
+                time.sleep(self._backoff(attempt))
+                continue
+            break
         if resp.status_code >= 400:
             raw = resp.text[:300]
             resp.close()
@@ -366,6 +454,13 @@ class GlmClient:
                 raise GlmAuthError(f"HTTP 401: {raw}")
             if resp.status_code == 429:
                 raise GlmRateLimitError(f"被限流: {raw}")
+            try:
+                if json.loads(raw).get("status") == C.STATUS_TRANSIENT:
+                    raise GlmTransientRejection(
+                        resp.status_code,
+                        f"对话接口被风控瞬时拒绝（已退避重试 {retries} 次）：请稍后重试")
+            except (ValueError, AttributeError):
+                pass
             raise GlmUpstreamError(resp.status_code, "对话接口返回错误", raw)
         ctype = resp.headers.get("Content-Type", "")
         if "text/event-stream" not in ctype:

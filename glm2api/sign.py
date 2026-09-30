@@ -26,11 +26,12 @@ def sign_now(now_ms: int | None = None) -> tuple[str, str, str]:
     return ts, nonce, sign
 
 
-def build_headers(token: str = "", cookie: str = "", accept: str = "application/json, text/plain, */*") -> dict[str, str]:
-    """组装一次请求的完整头。
+def build_headers(token: str = "", accept: str = "application/json, text/plain, */*") -> dict[str, str]:
+    """组装一次请求的完整头（**不含 Cookie**）。
 
-    token 为空时不带 Authorization（一般只有 refresh 之外的调用才会出现）。
-    cookie 由调用方按当前凭据拼好（见 credential.py 的 as_cookie）。
+    ⚠️ Cookie 必须交给 requests 的 cookie jar，**不要**在这里设显式 Cookie 头。
+    原因：显式 Cookie 头会**覆盖** jar，使服务端下发/轮转的 WAF cookie（acw_tc）
+    无法带回下一次请求，POST 类接口会持续返回 40012 bad request（实测踩坑，见 README §4.4）。
     """
     ts, nonce, sign = sign_now()
     h = {
@@ -52,6 +53,4 @@ def build_headers(token: str = "", cookie: str = "", accept: str = "application/
     }
     if token:
         h["Authorization"] = "Bearer " + token
-    if cookie:
-        h["Cookie"] = cookie
     return h
