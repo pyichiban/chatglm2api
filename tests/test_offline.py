@@ -295,3 +295,29 @@ def test_non_transient_error_not_retried(monkeypatch):
         client._json("POST", C.EP_CONV_LIST, body={"page": 1})
     assert len(calls) == 1
     client.close()
+
+
+# ── 生图（image 内容项）聚合 ─────────────────────────────────
+@needs_capture
+def test_aggregate_image_parts():
+    """IDE 抓包 sid 781：生图流（4 张图 + one_to_more_finish 收尾）。"""
+    ide = CAPTURE.parent / "chatglm2api" / "temp" / "saz_ide"  # 本项目 temp 下的解包目录
+    if not ide.exists():
+        pytest.skip(f"IDE 抓包目录不存在: {ide}")
+    raw = (ide / "raw" / "781_s.txt").read_bytes()
+    text = lines[lines.find(b"\r\n\r\n") + 4:].decode("utf-8", errors="replace")
+    agg = ChatAggregate()
+    for payload in iter_sse_data(text.splitlines()):
+        if obj := parse_frame(payload):
+            agg.feed(obj)
+    ensure_finished(agg)
+    res = agg.as_result()
+    assert res["finished"] and res["error"] is None
+    assert res["conversation_id"] == "6abcc9f0cf54e013be725885"
+    # 4 张成品图转成 Markdown 链接，且与抓包 URL 一致
+    urls = [f"https://sfile.chatglm.cn/testpath/6abcc9f0cf54e013be725886_{n}_0.jpg"
+            for n in (3, 0, 1, 2)]
+    for u in urls:
+        assert f"![]({u})" in res["text"]
+    # 末帧 one_to_more_finish 的空 image 项被跳过
+    assert res["text"].count("![](") == 4

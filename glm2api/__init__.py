@@ -18,11 +18,12 @@ from . import constants
 BASE = constants.BASE
 DEFAULT_ASSISTANT = constants.DEFAULT_ASSISTANT
 DEFAULT_MODEL = constants.DEFAULT_MODEL
+ASSISTANT_DRAWING = constants.ASSISTANT_DRAWING
 
 __all__ = [
     "GlmClient", "Credential", "load_credential", "make_credential", "save_credential",
     "GlmError", "GlmAuthError", "GlmRateLimitError", "GlmUpstreamError", "GlmStreamTruncated",
     "GlmTransientRejection",
-    "ChatAggregate", "BASE", "DEFAULT_ASSISTANT", "DEFAULT_MODEL", "constants",
+    "ChatAggregate", "BASE", "DEFAULT_ASSISTANT", "DEFAULT_MODEL", "ASSISTANT_DRAWING", "constants",
     "__version__",
 ]

@@ -159,14 +159,17 @@ class GlmClient:
 
     # ── 请求底层 ──────────────────────────────────────────────
     def _headers(self, accept: str) -> dict[str, str]:
-        h = build_headers(token=self.cred.access_token, accept=accept)
+        h = build_headers(token=self.cred.access_token, accept=accept, device_id=self.cred.device_id)
         if self.cred.device_id:
             h["X-Device-Id"] = self.cred.device_id  # 与 JWT.device_id 一致（PROTOCOL §1.2）
         h["X-Request-Id"] = secrets.token_hex(16)
         return h
 
     def _url(self, path: str) -> str:
-        return self.base + path
+        url = self.base + path
+        if self.cred.refer_991:
+            url += ("&" if "?" in url else "?") + "refer__991=" + self.cred.refer_991
+        return url
 
     def _raw_request(self, method: str, path: str, *, body: Any = None, params: dict | None = None,
                      accept: str = JSON_ACCEPT) -> requests.Response:
@@ -255,7 +258,7 @@ class GlmClient:
         ⚠️ 上游**会同时轮换 refresh_token**（PROTOCOL §1.3 铁律 1）：
         必须把响应里的新 refresh_token 落盘，否则下次启动用旧值 → 账号失效。
         """
-        h = build_headers(token=self.cred.refresh_token, accept=JSON_ACCEPT)
+        h = build_headers(token=self.cred.refresh_token, accept=JSON_ACCEPT, device_id=self.cred.device_id)
         if self.cred.device_id:
             h["X-Device-Id"] = self.cred.device_id
         h["X-Request-Id"] = secrets.token_hex(16)
@@ -379,6 +382,23 @@ class GlmClient:
         if not res.get("conversation_id"):
             raise GlmUpstreamError(0, "上游未返回 conversation_id（无法确认会话已创建）")
         return res["conversation_id"]
+
+    def generate_image(self, message: Any, conversation_id: str | None = None,
+                       stream: bool = False, aspect_ratio: str = "1:1",
+                       style: str = "none", scene: str = "none", **opts):
+        """AI 画图：走普通对话通道，仅换 assistant_id 并带 cogview 参数（IDE 抓包 sid 781 实证）。
+
+        返回结构与 chat() 一致；生图时 ``text`` 里含 Markdown 图片链接（![](url)），
+        或从 ``parts`` 里取 ``image`` 项。成品图直链（sfile.chatglm.cn）无需签名可直接下载。
+        注意：合法取值枚举未完整实证（仅见 aspect_ratio="3:4"/style="none"）。
+        """
+        cogview = {"aspect_ratio": aspect_ratio, "style": style, "scene": scene}
+        opts.setdefault("extra_meta", {})
+        base_cogview = opts["extra_meta"].setdefault("cogview", {"rm_label_watermark": False})
+        base_cogview.update(cogview)
+        opts["extra_meta"]["cogview"] = base_cogview
+        return self.chat(C.ASSISTANT_DRAWING, message, conversation_id=conversation_id,
+                         stream=stream, **opts)
 
     def rename_conversation(self, conversation_id: str, title: str) -> None:
         """POST conversation/modify_title。"""

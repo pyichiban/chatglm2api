@@ -63,6 +63,7 @@ class Credential:
     user_id: str = ""                # 与 JWT.uid 同源
     # 浏览器粘贴的额外 cookie 键值（如 ssxmod_itna），非必需；WAF 标记不要往里塞
     extra_cookies: dict[str, str] = field(default_factory=dict)
+    refer_991: str = ""            # 浏览器 JS 动态生成的 WAF 参数，从页面 URL query 复制
     source: str = ""                 # 加载来源（文件路径或 "env"），仅用于落盘与提示
 
     # ── 派生字段 ──────────────────────────────────────────────
@@ -114,7 +115,7 @@ class Credential:
 
 
 def make_credential(*, refresh_token: str = "", access_token: str = "", device_id: str = "",
-                    user_id: str = "", cookie: str = "") -> Credential:
+                    user_id: str = "", cookie: str = "", refer_991: str = "") -> Credential:
     """从「整条 cookie + 零散字段」构造凭据对象。"""
     ck = parse_cookie(cookie) if cookie else {}
     cred = Credential(
@@ -126,8 +127,10 @@ def make_credential(*, refresh_token: str = "", access_token: str = "", device_i
         extra_cookies={k: v for k, v in ck.items()
                        if k not in COOKIE_KEYS + WAF_COOKIE_KEYS
                        and not k.startswith(WAF_COOKIE_PREFIXES)},
+        refer_991=os.environ.get("GLM_REFER_991", ""),
     )
     cred.absorb_jwt()
+    cred.refer_991 = refer_991 or os.environ.get("GLM_REFER_991", "")
     return cred
 
 
@@ -182,6 +185,7 @@ def _load_file(path: str) -> Credential:
             device_id=d.get("device_id", ""),
             user_id=d.get("user_id", ""),
             cookie=d.get("cookie", ""),
+            refer_991=d.get("refer_991", ""),
         )
     # 纯文本：整条 cookie 或裸 refresh token，两种都支持
     return make_credential(cookie=raw, refresh_token="" if "=" in raw else raw)

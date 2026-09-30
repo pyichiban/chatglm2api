@@ -21,6 +21,8 @@ from .errors import GlmStreamTruncated
 # 视为「正文」的 content 类型（think 单独归入 reasoning）
 TEXT_TYPES = ("text", "code", "execution_output")
 THINK_TYPES = ("think", "tool_result", "quote_result")
+# 生图内容项（IDE 抓包 sid 781）：image[].image_url 为成品图直链
+IMAGE_TYPES = ("image",)
 
 
 def iter_sse_data(lines) -> Iterator[str]:
@@ -95,6 +97,7 @@ def render_part(part: dict) -> tuple[str, str, bool]:
     finished = part.get("status") == "finish"
     texts: list[str] = []
     thinks: list[str] = []
+    images: list[str] = []
     for c in part.get("content") or []:
         if not isinstance(c, dict):
             continue
@@ -103,6 +106,14 @@ def render_part(part: dict) -> tuple[str, str, bool]:
             texts.append(str(c.get("text") or c.get("code") or ""))
         elif t in THINK_TYPES:
             thinks.append(str(c.get("think") or c.get("content") or ""))
+        elif t in IMAGE_TYPES:
+            # 生图：每项转 Markdown 图片链接，跳过空对象（末帧 one_to_more_finish 的 image:[{}]）
+            for img in c.get("image") or []:
+                if isinstance(img, dict) and img.get("image_url"):
+                    images.append(str(img["image_url"]))
+    # 图片链接拼到正文后（非流式聚合用；流式透传不受影响）
+    if images:
+        texts.extend(f"![]({u})" for u in images)
     return "".join(texts), "".join(thinks), finished
 
 
