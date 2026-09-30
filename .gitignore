@@ -1,0 +1,29 @@
+# 凭据与本地环境
+glm_credential.json
+*.credential.json
+.env
+
+# 参考材料：逆向抓包原件与原型脚本（**含真实 token 明文**，绝不入库）
+ref/
+glm-tool-proto/
+
+# 临时文件（项目约定放 temp/）
+temp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
