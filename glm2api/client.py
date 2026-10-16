@@ -69,7 +69,7 @@ def build_chat_body(assistant_id: str, message: Any, conversation_id: str = "",
                                       "多轮上下文请用 conversation_id 由服务端维护")
         message = message[0]
     meta = {
-        "cogview": {"rm_label_watermark": False},
+        "cogview": {"rm_label_watermark": True},  # 写死去水印：实证 false 产物带「清言·AI生成」角标（用户要求永远去水印）
         "is_test": False,
         "input_question_type": "xxxx",
         "channel": "",
