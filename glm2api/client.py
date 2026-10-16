@@ -113,7 +113,8 @@ class GlmClient:
                  retry_base_delay: float | None = None):
         self.cred = credential
         self.base = base.rstrip("/")
-        # 风控瞬时拒绝（40012）的退避重试预算。批量调用时可调大；见 README §4.4。
+        # 风控瞬时拒绝（40012）的退避重试预算。批量调用时可调大；
+        # 分层实测与适用边界见 docs/生图协议与实操.md §3.5（对 chat_upload 无效）。
         self.max_retries = C.MAX_RETRIES if max_retries is None else max_retries
         self.retry_base_delay = C.RETRY_BASE_DELAY if retry_base_delay is None else retry_base_delay
         # 非流式用的超时；流式请求会显式传 timeout=None 覆盖它（见 _stream_post）
@@ -132,7 +133,7 @@ class GlmClient:
         用 jar 而**不是**显式 Cookie 头：显式头会覆盖 jar，使服务端下发/轮转的
         WAF cookie（acw_tc / cdn_sec_tc）无法带回下一次请求。清言走阿里云 WAF，
         POST 类接口（recent_list / assistant/stream）依赖该 cookie 链路，
-        缺失时持续返回 40012 bad request（实测，见 README §4.4）。
+        缺失时持续返回 40012 bad request（实测，见 docs/PROTOCOL.md §1.4）。
         这里只覆盖业务 cookie，不触碰 jar 里的 WAF cookie。
         """
         for k, v in (("chatglm_token", self.cred.access_token),
@@ -342,16 +343,26 @@ class GlmClient:
                 return
             page += 1
 
-    # ── 对话历史（结构未实证，动态透传）──────────────────────
+    # ── 对话历史 ──────────────────────────────────────────────
     def history(self, conversation_id: str, assistant_id: str = C.DEFAULT_ASSISTANT,
-                page_size: int = C.DEFAULT_HISTORY_PAGE_SIZE, **extra) -> dict:
-        """GET agent-api/conversation/page_messages_v2。
+                **extra) -> dict:
+        """GET mainchat-api/conversation/messages —— 单会话历史 [实证 2026-10-16]。
 
-        ⚠️ **已知缺口（PROTOCOL §3.5 / HANDOFF §4）**：``list`` 元素结构与翻页参数名
-        **在本次抓包中没有证据**（5 次调用全返回空数组）。因此本函数：
-          * 只透传 ``result``（含 list / little_more / greate_more），**不写死 list 元素字段**；
-          * 额外参数经 ``**extra`` 原样拼进 query，便于日后补测翻页参数名而无需改签名。
-        待补：在真实账号上「打开一条有真实消息的会话并向下翻页」再抓一次包。
+        返回上游 result 原样：``{conversation_id, messages:[{id, create_time, input, output, …}], …}``，
+        按 create_time **升序全量**，无分页（page_size/page 实测被忽略）。
+
+        ⚠️ assistant_id 必带且要与会话匹配（会话 = (assistant_id, conversation_id) 二元组）：
+        不传 ⇒ status=400 invalid param；传错 ⇒ ``messages:[]``（**静默空**，不报错）。
+        旧端点 page_messages_v2 实测始终返回空 list，已改走这里（PROTOCOL §3.5.1）。
+        """
+        params = {"conversation_id": conversation_id, "assistant_id": assistant_id, **extra}
+        return self._json("GET", C.EP_CONV_MESSAGES, params=params)
+
+    def history_v2(self, conversation_id: str, assistant_id: str = C.DEFAULT_ASSISTANT,
+                   page_size: int = C.DEFAULT_HISTORY_PAGE_SIZE, **extra) -> dict:
+        """❌ 老路子 page_messages_v2：**实测始终返回空 list**（PROTOCOL §3.5）。
+
+        保留仅供日后比对；新代码请用 :meth:`history`。额外参数经 ``**extra`` 拼进 query。
         """
         params = {"assistant_id": assistant_id, "conversation_id": conversation_id,
                   "page_size": page_size, **extra}
@@ -390,7 +401,12 @@ class GlmClient:
 
         返回结构与 chat() 一致；生图时 ``text`` 里含 Markdown 图片链接（![](url)），
         或从 ``parts`` 里取 ``image`` 项。成品图直链（sfile.chatglm.cn）无需签名可直接下载。
-        注意：合法取值枚举未完整实证（仅见 aspect_ratio="3:4"/style="none"）。
+
+        2026-10-15 复核：
+          * ``aspect_ratio`` 生效，实测映射 1:1→1024²、3:4→864×1152、4:3→1152×864、
+            9:16→720×1280、16:9→1280×720；**非法值静默降级为 1:1（不报错）**；
+          * ``style`` / ``scene`` **已失效**（传真实枚举也无效），仅作兼容透传；
+          * 参考图改图（智能编辑）不走本函数，见 ``docs/生图协议与实操.md``。
         """
         cogview = {"aspect_ratio": aspect_ratio, "style": style, "scene": scene}
         opts.setdefault("extra_meta", {})
@@ -399,6 +415,45 @@ class GlmClient:
         opts["extra_meta"]["cogview"] = base_cogview
         return self.chat(C.ASSISTANT_DRAWING, message, conversation_id=conversation_id,
                          stream=stream, **opts)
+
+    def edit_image(self, prompt: str, image_url: str, *, file_id: str = "",
+                   edit_type: str = C.EDIT_TYPE_INTELLIGENT, category: int = 1,
+                   rm_label_watermark: bool = True, title: str | None = None,
+                   if_plus_model: bool = False, aspect_ratio: str = "1:1",
+                   **extra) -> dict:
+        """参考图改图（智能编辑）：POST drawing-api/v1/image/reference。
+
+        ``image_url`` **必须是上游服务器能拉到的公网 URL**（自家 CDN / 境内图床 / ghproxy 中转均可）；
+        ``file_id`` 可留空（实测空串、旧 ID 都不影响）⇒ **不需要 chat_upload**。
+
+        返回 ``{image_url, conversation_id}``；产物直链无需签名，但会过期，建议立即下载。
+        注意：**输出比例强制跟随输入图**，``aspect_ratio`` 传值无效（实测 890×500 输入 + 传 1:1
+        → 输出 1760×992）⇒ 要正方形请先把参考图补白成 1:1。
+
+        ⚠️ **单图接口**：多图不支持（并列字段被上游静默忽略，分隔符拼接会被当成一个 URL 拒掉，
+        传数组直接 400）。要多角色同框，请**把多角色合并到同一张参考图**（如角色设定集），
+        再用 prompt 分块锚定各自特征；细节见 ``docs/生图协议与实操.md`` §3.7 / §3.8。
+
+        实测：内联 data URI 与境外不可达 URL 都会让上游报 status=500（拉不到图）；
+        拉不到图时上游 1~2s 就返回 status=10031「不支持该图片」，而正常出图要 17~22s。
+        """
+        body = {"image_url": image_url, "file_id": file_id, "type": edit_type,
+                "category": category, "conversation_id": "", "history_id": "",
+                "assistant_id": C.ASSISTANT_DRAWING, "prompt": prompt,
+                "if_plus_model": if_plus_model,
+                "title": title if title is not None else "【智能编辑】 " + prompt[:40],
+                "aspect_ratio": aspect_ratio, "rm_label_watermark": rm_label_watermark}
+        body.update(extra)
+        # 长请求（~17~22s）：用非流式超时（READ_TIMEOUT=60 够用）；该端点不限流，不走退避重试
+        resp = self._raw_request("POST", C.EP_IMAGE_REFERENCE, body=body)
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise GlmUpstreamError(resp.status_code, "响应不是合法 JSON", resp.text[:300]) from None
+        if resp.status_code >= 400:
+            raise GlmUpstreamError(resp.status_code, str(payload.get("message") or "http error"),
+                                   resp.text[:300])
+        return unwrap(payload)
 
     def rename_conversation(self, conversation_id: str, title: str) -> None:
         """POST conversation/modify_title。"""

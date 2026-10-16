@@ -70,7 +70,8 @@ def cmd_chat(client: GlmClient, args) -> None:
 
 
 def cmd_history(client: GlmClient, args) -> None:
-    _emit(client.history(args.conversation, assistant_id=args.assistant, page_size=args.page_size))
+    # 注意：--page-size 对 mainchat-api/conversation/messages 无效（上游无分页），故不透传
+    _emit(client.history(args.conversation, assistant_id=args.assistant))
 
 
 def cmd_rename(client: GlmClient, args) -> None:
