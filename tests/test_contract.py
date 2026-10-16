@@ -63,7 +63,8 @@ def test_endpoints_match_contract(ct):
            "conv_list": C.EP_CONV_LIST, "chat": C.EP_CHAT, "history": C.EP_CONV_MESSAGES,
            "history_v2_dead": C.EP_HISTORY, "bulk_delete": C.EP_BULK_DELETE,
            "modify_title": C.EP_MODIFY_TITLE, "conv_title": C.EP_CONV_TITLE,
-           "update_status": C.EP_UPDATE_STATUS, "stop_stream": C.EP_STOP_STREAM}
+           "update_status": C.EP_UPDATE_STATUS, "stop_stream": C.EP_STOP_STREAM,
+           "edit": C.EP_IMAGE_REFERENCE}
     assert got == ct["endpoints"]
     # V10 对齐：参考图改图已从 Python 移除（不可靠部分）
     assert not any(hasattr(GlmClient, m) for m in
