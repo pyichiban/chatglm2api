@@ -80,7 +80,11 @@ with GlmClient(load_credential("glm_credential.json")) as client:
         print(chunk.decode("utf-8", "replace"), end="")
 ```
 
-更多见 [`examples/`](examples/)。命令行用法：
+更多见 [`examples/`](examples/)。命令行入口 `python -m glm2api`（库自带的调试用）：
+
+> 需要**人 & agent 都能直接调的 CLI**（输入 → JSONL 事件流）请用兄弟仓库
+> **[pyichiban/chatglm-cli](https://github.com/pyichiban/chatglm-cli)**（Go，单文件零依赖）；
+> 两个仓库共用同一份 `glm_credential.json` 格式。
 
 ```bash
 python -m glm2api user-info
@@ -119,8 +123,20 @@ client.list_conversations(page=1, page_size=20)
 client.iter_conversations()                # 自动翻页直到 has_more=False
 
 client.chat(assistant_id, message, conversation_id=None, stream=False, **opts)
+client.generate_image(message, aspect_ratio="1:1", style="none", scene="none", **opts)
+                                           # AI 画图（走对话通道换 agent）；返回 text 里含 Markdown 图片链接
+                                           # ⚠️ style/scene 已失效；参考图改图见 docs/生图协议与实操.md
+client.edit_image(prompt, image_url, **opts)
+                                           # 参考图改图（智能编辑）→ {image_url, conversation_id}
+                                           # image_url 必须是**上游可达的公网 URL**（不需 chat_upload）；
+                                           # 输出比例强制跟随输入图（要正方形先补白）；**单图接口**，
+                                           # 多角色请合并到同一张参考图（见 docs/生图协议与实操.md §3.7/§3.8）
 client.create_conversation(message)        # ⚠️ 见下方「易错点 2」
-client.history(conversation_id, assistant_id, page_size=30, **extra)
+client.history(conversation_id, assistant_id, **extra)
+                                           # ✅ 单会话历史 [实证 2026-10-16]：GET mainchat-api/conversation/messages
+                                           # 升序全量、**无分页**（page_size/page 实测被忽略）；
+                                           # ⚠️ assistant_id 必带且要与会话匹配，传错直接空 messages
+client.history_v2(conversation_id, ...)    # ❌ 老路子 page_messages_v2：实测始终返空 list，仅留作比对
 client.rename_conversation(conversation_id, title)
 client.conversation_title(conversation_id)
 client.delete_conversations(ids, assistant_id)      # 走 bulk_delete
@@ -175,16 +191,41 @@ client.refresh()                           # 强制刷新
 
 ## 5. 已知缺口（如实标注，未做美化）
 
-**`GET /chatglm/agent-api/conversation/page_messages_v2` 的 `list` 元素结构与翻页参数名未实证。**
+### 5.1 单会话历史：`page_messages_v2` 是死路，可用端点已找到 ✅
 
-- 抓包中该接口被调用 5 次，**全部返回空数组** `{"list":[],"little_more":false,"greate_more":false}`。
-  原因：被点开的会话虽 `history_total:1`，但其 `meta_data` 带 `chat_mode:"chat_agent"` +
-  `subscribe_id:"deep_research"` = 沉思模式失败任务，消息不在普通消息表里 `[实证]`。
-- 因此本项目的 `history()` **只动态透传 `result`，不写死 `list` 元素字段**；
-  未知的翻页参数名可经 `**extra` 原样拼进 query，无需改函数签名。
-- 补齐方式：在真实账号上「打开一条**有真实消息**的会话并向下翻页」再抓一次包。
-  旁证：消息主键叫 `history_id`，取值与 SSE 帧 `parts[].id` 相同 `[实证]`，故 `list` 元素大概率与
-  SSE 的 assistant 消息同构 `[推断]` —— 但**这是推断，不是事实**。
+**原缺口（抓包 5 次全返空 `list`）已于 2026-10-16 实测解决**：这个端点确实是死路，
+但同一个会话的数据在另一个端点上，一次请求就能拿到全量消息：
+
+```
+GET /chatglm/mainchat-api/conversation/messages?conversation_id=<24hex>&assistant_id=<24hex>
+→ {conversation_id, project_id, if_plus_model, new_ai_search_conversation,
+   messages:[{id, create_time, update_time, input:{content[…], meta_data{…}},
+              output:{role, status, parts[…], last_error}, score, memory_score}]}
+```
+
+- `output` 与对话 SSE 帧**同构**（`parts[].content[]` 的 type 一致）⇒ 可用同一套聚合规则解析；
+- **升序全量、无分页**：`page_size=1` 实测被忽略，响应里也没有 `has_more` 类字段；
+- `assistant_id` 必带：不传 ⇒ `status=400 invalid param`；传错 ⇒ `messages:[]`（**静默空**，不报错）。
+  因为一个会话 = (`assistant_id`, `conversation_id`) 二元组。
+- 完整字段与证据见 [`docs/PROTOCOL.md` §3.5.1](docs/PROTOCOL.md)。
+- `history()` 已改指它；旧的 `page_messages_v2` 降为 `history_v2()` 仅供日后比对。
+
+### 5.2 参考图上传接口被 WAF 拦死（可绕开），且**不支持多图**
+
+`POST /chatglm/productivity-api/file/chat_upload` 在不带 `refer__991` 时 **100% 返回 40012**
+（2026-10-15 实测：win/pc 两种指纹、233KB PNG 与 31KB JPEG、冷却 2h25m 后单发——均被秒拒）。
+同刻 `recent_list`（写）与 `image/reference`（写）均正常 ⇒ 是这条 multipart 路径被单独拦，不是账号级限流。
+
+**绕开方式**：参考图改图**不需要上传** —— `POST drawing-api/v1/image/reference` 的 `image_url`
+接受**任意上游可达的公网图片 URL**（自家 CDN / 境内图床 / ghproxy 中转均可），`file_id` 可留空。
+
+**多图不支持**（两条独立结论，详见 [`docs/生图协议与实操.md`](docs/生图协议与实操.md) §3.7）：
+
+- `image/reference` 是单图接口：并列字段（`images`/`image_urls`/…）被静默忽略，数组直接 400；
+- 对话通道的图片项（`content[].type=="image"`）**只有主对话 agent 会读**（可多图、可多轮），
+  **画图 agent 完全忽略**。
+
+⇒ 多角色同框的正确做法：**把多个角色合并到同一张参考图**（如角色设定集），用 prompt 分块锚定（§3.8 已验证）。
 
 ---
 
@@ -221,6 +262,7 @@ glm2api/           核心包
   __main__.py      命令行入口
 docs/
   PROTOCOL.md      逆向协议文档（权威依据）
+  生图协议与实操.md  生图（文生图 / 参考图改图）协议 + 线上实测实操
   HANDOFF.md       交接说明（目标、边界、验收标准）
 examples/          最小示例
 tests/             离线回归测试（用真实抓包帧）

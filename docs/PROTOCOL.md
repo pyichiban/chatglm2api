@@ -48,6 +48,9 @@ body: {}
 
 **两条铁律**：
 1. **refresh token 会轮换** —— 响应里的新 `refresh_token` 必须落盘覆盖，否则下次用旧值必失败。
+   > 2026-10-16 补充实测：轮换**不是每次都发生** —— 一强制 `user/refresh` 调用里 access 变了而
+   > refresh 原值返回 `[实证]`。实现上按「响应里 refresh 非空就覆盖，且只要刷了就落盘」写，
+   > 两种情况都安全。**不能反过来**（只在「变了」时才写）：一旦漏写就是账号失效。
 2. 全 SAZ 只有这 **1 个**请求用 refresh 当 Authorization，其余 94 个业务请求全用 access。`[实证]`
 
 ### 1.4 明确**不是**凭据的东西（不要复刻）
@@ -59,6 +62,14 @@ body: {}
 - Cookie `ssxmod_itna` / `ssxmod_itna2` / `cdn_sec_tc` / `acw_tc`（CDN/WAF 标记）
 
 **新增依赖这些会让项目变脆，且无法复现（值随浏览器环境动态生成）。**
+
+> **⚠️ 2026-10-15 复核修正（重要）**：上表结论对**主对话类**请求成立（`user/info`、`recent_list`、
+> `assistant/stream` 等大量请求确实不带 `refer__991`），但对**画图那一族**请求不成立：
+> IDE 客户端的画图面板是 webview，`chat_upload` / `image/reference` / `drawing/config` /
+> 生图那条 `assistant/stream` **都带 `refer__991`**。实测后果：`productivity-api/file/chat_upload`
+> 在不带 `refer__991` 时 **100% 返回 40012**（win/pc 指纹、任意体积都被拒），
+> 而 `image/reference`、`assistant/stream` 仍可正常使用。
+> 详见 [`生图协议与实操.md`](生图协议与实操.md) §3.5。
 
 ---
 
@@ -229,7 +240,46 @@ GET /chatglm/agent-api/conversation/page_messages_v2
 - 消息主键叫 **`history_id`** —— `stream/update_status` 与 `stream/stop_stream` 用它，取值与 SSE 帧 `parts[].id` 完全相同。`[实证]`
 - SSE 里 assistant 消息结构已知（§3.6），`list` 元素 `[推断]` 同构。
 
-> **新项目要求**：实现该接口，但把 `list` 元素**动态透传（不写死字段）**，并在 README 标注「结构未实证」。若需补实证，应在真实账号上「打开一条有真实消息的会话并向下翻页」再抓一次。
+> **新项目要求（已于 2026-10-16 被 §3.5.1 推翻）**：当时只知道该接口返空，故要求把 `list` 元素**动态透传（不写死字段）**，并在 README 标注「结构未实证」。—— 实际上这个端点是死路，数据在 `mainchat-api/conversation/messages` 上。
+
+#### 3.5.1 ✅ 2026-10-16 补齐实证：真正的历史端点是 `mainchat-api/conversation/messages`
+
+上面那个 `page_messages_v2` 是**死路**（在刚发消息的会话上重试仍返回 `{"list":[],…}`），
+但同一个会话的数据其实在另一个同名族端点上，**一次请求就拿到全量升序消息** `[实证]`：
+
+```
+GET /chatglm/mainchat-api/conversation/messages
+      ?conversation_id=<24hex>&assistant_id=<24hex>
+→ {"status":0,"result":{
+     "conversation_id":"…","project_id":"","if_plus_model":false,"plus_model_available":true,
+     "new_ai_search_conversation":false,
+     "messages":[{
+        "id":"6ad16e02581cc70756919adf",          // == SSE 帧的 history_id
+        "conversation_id":"…",
+        "create_time":"2026-10-16 08:21:22",     // 字符串时间，**不是 Unix 秒**
+        "create_time_str":"今天", "update_time":"…",
+        "input":{"content":[{"type":"text","text":"只回复两个字：收到"}],
+                 "meta_data":{"input_question_type":"xxxx","exp_groups":[…]}},
+        "output":{"role":"assistant","status":"finish","last_error":{},
+                  "parts":[{"id":"…","logic_id":"…","status":"finish","model":"moe_53f",
+                             "content":[{"type":"think|text|tool_calls|image", …}]}]},
+        "score":{}, "memory_score":{}}]}}
+```
+
+实测结论：
+
+| 项 | 结果 |
+|---|---|
+| 一轮 = 一条 message | ✅ `input`（用户）+ `output`（助手）成对，`messages[]` 按 `create_time` **升序** |
+| `output` 结构 | ✅ 与 §3.6 的 SSE 帧**同构**（`parts[].content[]` 的 type 一致）⇒ 可用同一个聚合器解析 |
+| 分页 | ❌ **没有分页**：`page_size=1` 实测被忽略（3 条会话仍返 3 条）；也没有 `has_more` 类字段 |
+| `assistant_id` 必带 | ✅ 不传 ⇒ `status=400 invalid param`；传错 ⇒ `messages:[]`（**静默空**，与会话 = (assistant_id, conversation_id) 二元组自洽） |
+| 生图会话 | ✅ 同样可读（传 `ASSISTANT_DRAWING`），图产物在 `parts[].content[].image[].image_url` |
+| 拓的端点 | `mainchat-api/conversation/detail`、`mainchat-api/history/list` ⇒ `not found`；`agent-api/conversation/page_messages`（无 `_v2`）⇒ 空 list；`agent-api/conversation/list` ⇒ 返的是**全站示例会话**，与本账号无关，不可用 `[实证]` |
+
+⇒ **新项目 `history()` 应改指 `mainchat-api/conversation/messages`**（glm2cli 已按此实现，
+`glm2cli/internal/glm/history.go` + `testdata/history.json` 有回放测试），
+并把 `page_messages_v2` 保留为已弃用常量仅供比对。
 
 ### 3.6 对话（首次 / 多轮）`[实证]` sid 356（首轮）、480（多轮）
 
@@ -326,7 +376,7 @@ GET /chatglm/mainchat-api/conversation/title?conversation_id=<id>
 |---|---|---|
 | `65940acff94777010aa6b796` | ChatGLM（主对话） | `main` |
 | `68f0b8c110eea3e78b0e0e5e` | 学习搭子 | |
-| `65a232c082ff90a2ad2f15e2` | AI画图 | |
+| `65a232c082ff90a2ad2f15e2` | AI画图 | 生图/参考图改图详见 [`生图协议与实操.md`](生图协议与实操.md) |
 | `658a7988b8a9a98d38725745` | AI阅读 | |
 | `668d03b2e99d661ed3c32516` | 视频助手 | |
 
