@@ -63,9 +63,11 @@ def test_endpoints_match_contract(ct):
            "conv_list": C.EP_CONV_LIST, "chat": C.EP_CHAT, "history": C.EP_CONV_MESSAGES,
            "history_v2_dead": C.EP_HISTORY, "bulk_delete": C.EP_BULK_DELETE,
            "modify_title": C.EP_MODIFY_TITLE, "conv_title": C.EP_CONV_TITLE,
-           "update_status": C.EP_UPDATE_STATUS, "stop_stream": C.EP_STOP_STREAM,
-           "image_reference": C.EP_IMAGE_REFERENCE}
+           "update_status": C.EP_UPDATE_STATUS, "stop_stream": C.EP_STOP_STREAM}
     assert got == ct["endpoints"]
+    # V10 对齐：参考图改图已从 Python 移除（不可靠部分）
+    assert not any(hasattr(GlmClient, m) for m in
+                   ("generate_image", "edit_image", "create_conversation", "iter_conversations"))
 
 
 def test_defaults_codes_timeouts(ct):
@@ -129,11 +131,13 @@ def test_per_request_extra_headers(ct):
     cl.close()
 
 
-def test_divergence_v3_accept_encoding(ct):
-    """V3：Python 发 br/zstd，Go 只发 gzip/deflate。改任一边都要先改契约。"""
-    assert build_headers()["Accept-Encoding"] == "gzip, deflate, br, zstd"
-    d = next(x for x in ct["known_divergences"] if x["id"] == "V3")
-    assert "br" in d["python"] and "br" not in d["go"]
+def test_accept_encoding_and_content_type_aligned(ct):
+    """V3/V4 已对齐：只发 gzip, deflate；有 body 时发 Content-Type（与抓包/Go 一致）。"""
+    h = build_headers()
+    assert h["Accept-Encoding"] == ct["channel"]["accept_encoding"] == "gzip, deflate"
+    assert ct["channel"]["proxy_support"] is False
+    assert "proxies" not in GlmClient.__init__.__code__.co_varnames   # V12：代理已移除
+    # V4：带 body 的请求必须带 Content-Type（见 test_request_shapes 的头断言）
 
 
 # ── HTTP 替身 ───────────────────────────────────────────────
@@ -236,17 +240,13 @@ def test_chat_body_first_turn_and_multiturn(ct):
         build_chat_body(C.DEFAULT_ASSISTANT, [{"content": "a"}, {"content": "b"}])
 
 
-def test_generate_image_body(ct):
-    """生图 = 对话通道换 agent + cogview（V7：Python 总带 style/scene）。"""
-    cl = _client()
-    sent = {}
-    cl.chat = lambda aid, msg, **kw: (sent.update(aid=aid, kw=kw), {"text": ""})[1]
-    cl.generate_image("画只猫", aspect_ratio="3:4")
-    assert sent["aid"] == ct["agents"]["drawing"]
-    cw = sent["kw"]["extra_meta"]["cogview"]
-    assert sorted(cw) == sorted(ct["chat_body"]["cogview_base_keys"] + ct["chat_body"]["cogview_drawing_keys"])
-    assert cw["aspect_ratio"] == "3:4" and cw["style"] == "none" and cw["scene"] == "none"
-    cl.close()
+def test_generate_image_removed(ct):
+    """生图功能已从 Python 整体移除（Python = Go 版子集，生图入口只在 Go CLI）。"""
+    assert "image_reference" not in ct["endpoints"]
+    assert not hasattr(GlmClient, "generate_image") and not hasattr(GlmClient, "edit_image")
+    # 但 agent 常量与 cogview 契约保留（Go 侧仍用）
+    assert C.ASSISTANT_DRAWING == ct["agents"]["drawing"]
+    assert sorted(ct["chat_body"]["cogview_drawing_keys"]) == ["aspect_ratio", "scene", "style"]
 
 
 def test_request_shapes(ct):
@@ -255,7 +255,7 @@ def test_request_shapes(ct):
     cases = [
         ("history", lambda c: c.history("c" * 24, assistant_id="a" * 24), shapes["history"]),
         ("history_v2", lambda c: c.history_v2("c" * 24), shapes["history_v2"]),
-        ("conv_list", lambda c: c.list_conversations(), shapes["conv_list"]),
+        ("conv_list", lambda c: c.list_conversations_page(), shapes["conv_list"]),
         ("rename", lambda c: c.rename_conversation("c" * 24, "T"), shapes["rename"]),
         ("conv_title", lambda c: c.conversation_title("c" * 24), shapes["conv_title"]),
         ("bulk_delete", lambda c: c.delete_conversations(["c" * 24]), shapes["bulk_delete"]),
@@ -275,7 +275,42 @@ def test_request_shapes(ct):
             assert sorted(c0["body"]) == sorted(want["body_keys"]), (name, c0["body"])
         if want.get("pagination_params") == []:
             assert "page" not in c0["params"] and "page_size" not in c0["params"], name
+        # V4 对齐：带 body 的 POST 必须带 Content-Type；且永不出现 Cookie 头
+        if c0["body"] is not None:
+            assert c0["headers"].get("Content-Type") == ct["channel"]["content_type_on_body"], name
+        assert "Cookie" not in c0["headers"], name
         cl.close()
+
+
+def test_list_conversations_paginates_internally(ct):
+    """V14 对齐：list_conversations 内部翻页，对外一次返回完整列表。"""
+    cl = _client([
+        {"status": 0, "result": {"has_more": True,
+                                  "conversation_list": [{"conversation_id": "a" * 24, "title": "P1"}]}},
+        {"status": 0, "result": {"has_more": False,
+                                  "conversation_list": [{"conversation_id": "b" * 24, "title": "P2"}]}},
+    ])
+    convs = cl.list_conversations()
+    assert [c["conversation_id"] for c in convs] == ["a" * 24, "b" * 24]
+    assert len(cl.session.calls) == 2                       # 内部翻了 2 页
+    assert cl.session.calls[0]["body"] == {"page": 1, "page_size": C.DEFAULT_PAGE_SIZE}
+    assert cl.session.calls[1]["body"] == {"page": 2, "page_size": C.DEFAULT_PAGE_SIZE}
+    cl.close()
+
+
+def test_history_turns_normalization(ct):
+    """V9 对齐：history_turns 与 Go 的 ParseHistory 同一契约（见 fixtures.history.json）。"""
+    want = ct["fixtures"]["history.json"]
+    raw = (FIXDIR / "history.json").read_text(encoding="utf-8")
+    cl = _client([{"status": 0, "result": json.loads(raw)}, {"status": 0, "result": json.loads(raw)}])
+    turns = cl.history_turns("c" * 24)
+    assert [t["message_id"] for t in turns] == want["message_ids"]
+    assert turns[0]["user"] == want["pairs"][0][0] and turns[0]["text"] == want["pairs"][0][1]
+    assert turns[0]["created_at"] == want["created_at_head"]
+    assert sorted(turns[0]) == sorted(ct["python_turn_keys"])
+    raw_turns = cl.history_turns("c" * 24, with_raw=True)
+    assert "input" in raw_turns[0] and "output" in raw_turns[0]
+    cl.close()
 
 
 def test_stream_request_has_no_timeout(ct):
@@ -313,14 +348,14 @@ def test_envelope_error_mapping(ct):
     assert unwrap({"status": 0, "result": {"a": 1}}) == {"a": 1}
 
 
-def test_transient_rejection_retries(ct):
-    """V1：Python 命中 40012 会指数退避重试 MAX_RETRIES 次；Go 不重试直接报错。"""
-    cl = _client([FakeResp(400, {"status": 40012, "message": "bad request"})] * 9)
-    with pytest.raises(GlmTransientRejection):
+def test_transient_rejection_no_retry(ct):
+    """V1 已对齐：命中 40012 不重试，直接抛 GlmTransientRejection，且只发一次请求。"""
+    assert ct["retry"]["enabled"] is False
+    cl = _client([FakeResp(400, {"status": 40012, "message": "bad request"})])
+    with pytest.raises(GlmTransientRejection) as ei:
         cl.user_info()
-    assert len(cl.session.calls) == C.MAX_RETRIES + 1
-    d = next(x for x in ct["known_divergences"] if x["id"] == "V1")
-    assert str(C.MAX_RETRIES) in d["python"] and "不重试" in d["go"]
+    assert "不做退避重试" in str(ei.value)
+    assert len(cl.session.calls) == 1
     cl.close()
 
 
@@ -364,17 +399,36 @@ def test_refresh_shape_and_persist(ct, tmp_path):
     c0 = fake.calls[-1]
     path, _, query = c0["url"].partition("?")
     assert path.endswith(CONTRACT["endpoints"][ct["request_shapes"]["refresh"]["endpoint"]])
-    # V2 差异：Python 仍支持 refer__991（凭据里有就拼进 query），Go 已彻底移除
-    assert "refer__991=" in query
-    d2 = next(x for x in ct["known_divergences"] if x["id"] == "V2")
-    assert "refer_991" in d2["python"] and "移除" in d2["go"]
+    # V2 已对齐：不再拼 refer__991
+    assert "refer__991" not in query and "refer__991" not in c0["url"]
     assert c0["headers"]["Authorization"] == "Bearer old-root-token"   # 根凭据放 Authorization
     assert c0["body"] == ct["request_shapes"]["refresh"]["body"]
     assert cred.refresh_token == new_root
     on_disk = json.loads(credfile.read_text(encoding="utf-8"))
     assert on_disk["refresh_token"] == new_root                  # 落了盘（铁律 1）
-    assert sorted(on_disk) == sorted(ct["credential_file"]["keys"])
+    # V5 已对齐：未知键必须保留（文件里预置的 refer_991 不能被抹掉），且含并发覆盖保护
+    assert on_disk.get("refer_991") == "python-drops-this"
+    assert ct["credential_file"]["preserve_unknown_keys"] is True
     cl.close()
+
+
+def test_save_preserves_unknown_keys_and_refuses_clobber(tmp_path):
+    """V5 对齐 Go：写盘保留未知键；磁盘上的 refresh 已被其它进程轮换 ⇒ 拒绝覆盖。"""
+    credfile = tmp_path / "cred.json"
+    credfile.write_text(json.dumps({"refresh_token": "A", "refer_991": "keep", "note": {}}),
+                        encoding="utf-8")
+    cred = load_credential(str(credfile))
+    cred.refresh_token = "B"
+    save_credential(cred)
+    on_disk = json.loads(credfile.read_text(encoding="utf-8"))
+    assert on_disk["refresh_token"] == "B"
+    assert on_disk.get("refer_991") == "keep" and on_disk.get("note") == {}
+    # 另一个进程已把文件改成 C ⇒ 我们的 B 不得覆盖
+    credfile.write_text(json.dumps({"refresh_token": "C"}), encoding="utf-8")
+    cred.refresh_token = "D"
+    with pytest.raises(GlmUpstreamError):
+        save_credential(cred)
+    assert json.loads(credfile.read_text(encoding="utf-8"))["refresh_token"] == "C"
 
 
 def test_save_requires_file_source(ct):
@@ -431,13 +485,25 @@ def test_bare_envelope_line_is_ignored(ct):
     assert all(parse_frame(p) and parse_frame(p).get("conversation_id") for p in payloads)
 
 
-def test_truncated_stream_raises(ct):
-    assert ct["sse_rules"]["truncation"].startswith("未见 finish/error")
+def test_stream_truncated_raises_and_raw_passthrough_verifies(ct):
+    """V8 对齐：截断必须报错；raw 透传形态也要做同样的收尾校验。"""
+    assert "raw 透传形态也必须做同样校验" in ct["sse_rules"]["truncation"]
     agg = ChatAggregate()
     agg.feed(json.loads('{"status":"init","parts":[{"logic_id":"L",'
                         '"content":[{"type":"text","text":"半句"}]}]}'))
     with pytest.raises(GlmStreamTruncated):
         ensure_finished(agg)
+    # raw 透传：完整流不报错，截断流抛 GlmStreamTruncated
+    ok_stream = (FIXDIR / "stream_first.txt").read_text(encoding="utf-8")
+    cl = _client([FakeResp(200, raw=ok_stream, headers={"Content-Type": "text/event-stream"})])
+    chunks = list(cl._chat_stream({"assistant_id": C.DEFAULT_ASSISTANT}))
+    assert chunks and "你好" in b"".join(chunks).decode("utf-8")
+    cl.close()
+    cut = ok_stream[: ok_stream.rfind("\n\n", 0, len(ok_stream) // 2)]
+    cl = _client([FakeResp(200, raw=cut, headers={"Content-Type": "text/event-stream"})])
+    with pytest.raises(GlmStreamTruncated):
+        list(cl._chat_stream({"assistant_id": C.DEFAULT_ASSISTANT}))
+    cl.close()
 
 
 def test_no_done_sentinel(ct):

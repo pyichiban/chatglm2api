@@ -72,16 +72,11 @@ SEC_CH_UA = '"Not;A=Brand";v="8", "Chromium";v="150"'
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 60
 
-# ── 风控瞬时拒绝 → 退避重试 ─────────────────────────────────
-# 清言走阿里云 WAF，POST 类接口会被瞬时拒绝（HTTP 400 + status=40012）。
-# 2026-10-15 实测分层结论（详见 docs/生图协议与实操.md §3.5）：
-#   * assistant/stream（对话/生图）、recent_list、bulk_delete —— 不带 refer__991 也正常；
-#   * productivity-api/file/chat_upload（multipart 上传）—— 不带 refer__991 时 100% 40012，
-#     换 win/pc 指纹、减小体积、冷却 2h25m 均无效 ⇒ 该路径需 refer__991，或改用公网 URL 绕开。
-# 退避重试仍作为瞬时拒绝的兜底（对 chat_upload 无效，别指望靠重试蒙过去）。
+# ── 风控瞬时拒绝（不退避重试）────────────────────────────────
+# 清言走阿里云 WAF，POST 类接口可能返回 HTTP 400 + status=40012。
+# 2026-10-16 定稿：仅走 IDE(Electron) 通道，实测稳定，**不做退避重试** ——
+# 命中即抛 GlmTransientRejection，由调用方决定是否重跑（与 Go 版对齐，见 contract.json retry 段）。
 STATUS_TRANSIENT = 40012
-MAX_RETRIES = 4          # 重试次数上限（含首次共 5 次请求）
-RETRY_BASE_DELAY = 1.0   # 退避基数（秒）：delay = base * 2**attempt * jitter
 
 # ── 环境变量 ─────────────────────────────────────────────────
 ENV_REFRESH_TOKEN = "GLM_REFRESH_TOKEN"
@@ -90,7 +85,6 @@ ENV_DEVICE_ID = "GLM_DEVICE_ID"
 ENV_USER_ID = "GLM_USER_ID"
 ENV_COOKIE = "GLM_COOKIE"
 ENV_CRED_FILE = "GLM_CREDENTIAL_FILE"
-ENV_REFER_991 = "GLM_REFER_991"  # 浏览器生成的 WAF 参数，从 URL query 复制（画图族接口需要，见 docs/生图协议与实操.md）
 
 # IDE 客户端实测的实验分组串（sid 281）。服务端不校验取值，但必须存在（WAF 指纹）。
 EXP_GROUPS = (

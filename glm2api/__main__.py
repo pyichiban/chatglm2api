@@ -41,13 +41,10 @@ def cmd_models(client: GlmClient, args) -> None:
 
 
 def cmd_conversations(client: GlmClient, args) -> None:
-    if args.all:
-        for i, conv in enumerate(client.iter_conversations(), 1):
-            print(f"{i:>3} {conv.get('conversation_id')} {conv.get('update_time')} "
-                  f"{conv.get('title')}")
-        return
-    res = client.list_conversations(page=args.page, page_size=args.page_size)
-    _emit(res)
+    # V14 对齐：内部翻页，直接返回完整列表（调用方不感知分页）
+    for i, conv in enumerate(client.list_conversations(), 1):
+        print(f"{i:>3} {conv.get('conversation_id')} {conv.get('update_time')} "
+              f"{conv.get('title')}")
 
 
 def cmd_chat(client: GlmClient, args) -> None:
@@ -70,8 +67,13 @@ def cmd_chat(client: GlmClient, args) -> None:
 
 
 def cmd_history(client: GlmClient, args) -> None:
-    # 注意：--page-size 对 mainchat-api/conversation/messages 无效（上游无分页），故不透传
-    _emit(client.history(args.conversation, assistant_id=args.assistant))
+    if args.raw:
+        _emit(client.history(args.conversation, assistant_id=args.assistant))
+        return
+    # 默认输出规范化的一问一答（与 Go 版 conv history 对齐）
+    for t in client.history_turns(args.conversation, assistant_id=args.assistant):
+        print(f"[{t['created_at']}] 用户: {t['user']}")
+        print(f"           助手: {t['text']}")
 
 
 def cmd_rename(client: GlmClient, args) -> None:
@@ -92,20 +94,16 @@ def cmd_refresh(client: GlmClient, args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("glm2api", description="智谱清言网页版私有接口客户端")
+    p = argparse.ArgumentParser("glm2api", description="智谱清言私有接口客户端（IDE 通道，Go 版 chatglm-cli 的子集）")
     p.add_argument("--cred", help="凭据文件路径（默认 $GLM_CREDENTIAL_FILE 或 ./glm_credential.json）")
     p.add_argument("--base", default=C.BASE, help="上游基址（默认 %(default)s）")
-    p.add_argument("--proxy", help="HTTP 代理，如 http://127.0.0.1:10809")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("user-info", help="用户信息（含积分余额）").set_defaults(fn=cmd_user_info)
 
     sub.add_parser("models", help="可用模型列表").set_defaults(fn=cmd_models)
 
-    pc = sub.add_parser("conversations", help="会话列表")
-    pc.add_argument("-p", "--page", type=int, default=1)
-    pc.add_argument("-s", "--page-size", type=int, default=C.DEFAULT_PAGE_SIZE)
-    pc.add_argument("-a", "--all", action="store_true", help="自动翻页输出全部")
+    pc = sub.add_parser("conversations", help="会话完整列表（内部自动翻页）")
     pc.set_defaults(fn=cmd_conversations)
 
     pch = sub.add_parser("chat", help="发一条消息")
@@ -119,10 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
     pch.add_argument("--stream", action="store_true", help="原样透传上游 SSE")
     pch.set_defaults(fn=cmd_chat)
 
-    ph = sub.add_parser("history", help="会话历史消息（list 结构未实证，原样透传）")
+    ph = sub.add_parser("history", help="会话历史（--raw 上游原样；默认输出规范化的一问一答）")
     ph.add_argument("conversation")
     ph.add_argument("-a", "--assistant", default=C.DEFAULT_ASSISTANT)
-    ph.add_argument("-s", "--page-size", type=int, default=C.DEFAULT_HISTORY_PAGE_SIZE)
+    ph.add_argument("--raw", action="store_true", help="输出上游 result 原样")
     ph.set_defaults(fn=cmd_history)
 
     pr = sub.add_parser("rename", help="重命名会话")
@@ -141,10 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    proxies = {"http": args.proxy, "https": args.proxy} if args.proxy else None
     try:
         cred = load_credential(args.cred)
-        with GlmClient(cred, base=args.base, proxies=proxies) as client:
+        with GlmClient(cred, base=args.base) as client:
             args.fn(client, args)
     except GlmError as e:
         print(f"[glm2api] {e}", file=sys.stderr)

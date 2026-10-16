@@ -1,16 +1,15 @@
-"""清言上游 HTTP 客户端（依赖仅 requests）。
+"""清言上游 HTTP 客户端（依赖仅 requests）。与 Go 版 chatglm-cli 逐项对齐（见 contract.json）。
 
 设计要点（全部有实证依据，见 PROTOCOL.md）：
-  * 统一入口 _request/_json，自动注入签名三件套与伪装头。
+  * 统一入口 _request/_json，自动注入签名三件套与伪装头；有 body 时发 Content-Type（V4）。
+  * 仅 IDE 通道：无 refer__991（V2）；**不做退避重试**（V1），40012 直接抛 GlmTransientRejection。
+  * Accept-Encoding 只发 gzip, deflate（V3）；流式请求**不设 timeout**（硬规则）。
   * ensure_token：access 缺失/过期即用 refresh 换，且**换完必须落盘**（会轮换 refresh_token）。
-  * 流式请求**不设 timeout**（AGENTS.md R35）；非流式请求保留超时。
-  * 流被截断**不补结束帧**，抛 GlmStreamTruncated（AGENTS.md R36）。
+  * 流被截断**不补结束帧**，抛 GlmStreamTruncated（V8：raw 透传形态同样校验收尾）。
 """
 
 import json
-import random
 import secrets
-import time
 from typing import Any, Iterator
 
 import requests
@@ -20,7 +19,8 @@ from .credential import Credential, save_credential
 from .errors import (GlmAuthError, GlmRateLimitError, GlmStreamTruncated, GlmTransientRejection,
                      GlmUpstreamError)
 from .sign import build_headers, sign_now
-from .sse import ChatAggregate, ensure_finished, iter_sse_data, parse_frame
+from .sse import (TEXT_TYPES, THINK_TYPES, ChatAggregate, ensure_finished,     # noqa: F401
+                  iter_sse_data, parse_frame)
 
 JSON_ACCEPT = "application/json, text/plain, */*"
 SSE_ACCEPT = "text/event-stream"
@@ -108,22 +108,14 @@ def unwrap(payload: dict) -> dict:
 class GlmClient:
     """清言网页版私有接口客户端。一个实例对应一份凭据。"""
 
-    def __init__(self, credential: Credential, *, base: str = C.BASE, verify: bool = True,
-                 proxies: dict | None = None, max_retries: int | None = None,
-                 retry_base_delay: float | None = None):
+    def __init__(self, credential: Credential, *, base: str = C.BASE, verify: bool = True):
         self.cred = credential
         self.base = base.rstrip("/")
-        # 风控瞬时拒绝（40012）的退避重试预算。批量调用时可调大；
-        # 分层实测与适用边界见 docs/生图协议与实操.md §3.5（对 chat_upload 无效）。
-        self.max_retries = C.MAX_RETRIES if max_retries is None else max_retries
-        self.retry_base_delay = C.RETRY_BASE_DELAY if retry_base_delay is None else retry_base_delay
-        # 非流式用的超时；流式请求会显式传 timeout=None 覆盖它（见 _stream_post）
+        # 非流式用的超时；流式请求会显式传 timeout=None 覆盖它（见 _stream_response）
         self.timeout = (C.CONNECT_TIMEOUT, C.READ_TIMEOUT)
         self.session = requests.Session()
         if not verify:
             self.session.verify = False
-        if proxies:
-            self.session.proxies.update(proxies)
         self._sync_cookies()
 
     # ── Cookie ────────────────────────────────────────────────
@@ -167,66 +159,39 @@ class GlmClient:
         return h
 
     def _url(self, path: str) -> str:
-        url = self.base + path
-        if self.cred.refer_991:
-            url += ("&" if "?" in url else "?") + "refer__991=" + self.cred.refer_991
-        return url
+        # V2 已对齐：IDE 通道不需要 refer__991，彻底移除
+        return self.base + path
 
     def _raw_request(self, method: str, path: str, *, body: Any = None, params: dict | None = None,
                      accept: str = JSON_ACCEPT) -> requests.Response:
-        """发一次带签名的请求（含 401 自愈重试），**不做风控退避**。"""
+        """发一次带签名的请求（含 401 自愈重试，仅此一种重试）。"""
         self.ensure_token()
+        headers = self._headers(accept)
+        if body is not None:
+            headers["Content-Type"] = "application/json;charset=UTF-8"   # V4 对齐：与抓包/Go 一致
         resp = self.session.request(
-            method, self._url(path), headers=self._headers(accept),
+            method, self._url(path), headers=headers,
             data=json.dumps(body).encode() if body is not None else None,
             params=params, timeout=self.timeout,
         )
         if resp.status_code == 401:
-            self.ensure_token(force=True)  # 本地 exp 未到但上游已作废，靠 401 触发自愈（不变量 19）
+            self.ensure_token(force=True)  # 本地 exp 未到但上游已作废，靠 401 触发自愈（仅重一次）
             resp.close()
             resp = self.session.request(
-                method, self._url(path), headers=self._headers(accept),
+                method, self._url(path), headers=headers,
                 data=json.dumps(body).encode() if body is not None else None,
                 params=params, timeout=self.timeout,
             )
         return resp
 
-    @staticmethod
-    def _is_transient(resp: requests.Response) -> bool:
-        """HTTP 400 + 信封 status=40012 = 风控瞬时拒绝，可退避重试（实测，见 constants）。"""
-        if resp.status_code != 400:
-            return False
-        try:
-            return resp.json().get("status") == C.STATUS_TRANSIENT
-        except ValueError:
-            return False
-
     def _request(self, method: str, path: str, *, body: Any = None, params: dict | None = None,
-                 accept: str = JSON_ACCEPT, retries: int | None = None) -> requests.Response:
-        """带风控退避重试的请求。
+                 accept: str = JSON_ACCEPT) -> requests.Response:
+        """单次请求，**不做退避重试**（V1 对齐 Go：IDE 链路实测稳定，失败直接抛错）。"""
+        return self._raw_request(method, path, body=body, params=params, accept=accept)
 
-        清言 POST 类接口会以 40012 瞬时拒绝；实测连发 10 次全失败、退避后成功，
-        所以这里必须退避重试而不是直接报错。GET 类接口不受影响（不会触发重试）。
-        """
-        retries = self.max_retries if retries is None else retries
-        for attempt in range(retries + 1):
-            resp = self._raw_request(method, path, body=body, params=params, accept=accept)
-            if attempt < retries and self._is_transient(resp):
-                resp.close()
-                # 指数退避 + 抖动，避免多客户端同频重试再次被拒
-                time.sleep(self._backoff(attempt))
-                continue
-            return resp
-        return resp  # pragma: no cover —— 循环必返回
-
-    def _backoff(self, attempt: int) -> float:
-        """指数退避 + 50%~150% 抖动。"""
-        return self.retry_base_delay * (2 ** attempt) * (0.5 + random.random())
-
-    def _json(self, method: str, path: str, *, body: Any = None, params: dict | None = None,
-              retries: int | None = None) -> dict:
+    def _json(self, method: str, path: str, *, body: Any = None, params: dict | None = None) -> dict:
         """发请求并解信封，返回 result。"""
-        resp = self._request(method, path, body=body, params=params, retries=retries)
+        resp = self._request(method, path, body=body, params=params)
         try:
             raw = resp.content
             payload = json.loads(raw.decode("utf-8", errors="replace"))
@@ -239,8 +204,8 @@ class GlmClient:
             raise GlmAuthError(f"HTTP 401: {payload.get('message')}")
         if payload.get("status") == C.STATUS_TRANSIENT:
             raise GlmTransientRejection(
-                resp.status_code, f"风控瞬时拒绝（已退避重试 {retries or self.max_retries} 次仍失败）: "
-                                   f"{payload.get('message')}；稍后重试或降低请求频率")
+                resp.status_code, "风控瞬时拒绝（本实现不做退避重试：IDE 链路实测稳定）；"
+                                  f"请稍后重跑或降低频率: {payload.get('message')}")
         if resp.status_code >= 400:
             raise GlmUpstreamError(resp.status_code, str(payload.get("message") or "http error"),
                                    resp.text[:300])
@@ -271,15 +236,8 @@ class GlmClient:
         if self.cred.user_id:
             rs.cookies.set("chatglm_user_id", self.cred.user_id, domain="chatglm.cn", path="/")
         try:
-            # 刷新接口同样会被风控瞬时拒绝（实测 40012），必须退避重试
-            for attempt in range(self.max_retries + 1):
-                h["X-Timestamp"], h["X-Nonce"], h["X-Sign"] = sign_now()  # 重试需换新签名
-                resp = rs.post(self._url(C.EP_REFRESH), headers=h, data=b"{}", timeout=self.timeout)
-                if attempt < self.max_retries and self._is_transient(resp):
-                    resp.close()
-                    time.sleep(self._backoff(attempt))
-                    continue
-                break
+            h["X-Timestamp"], h["X-Nonce"], h["X-Sign"] = sign_now()
+            resp = rs.post(self._url(C.EP_REFRESH), headers=h, data=b"{}", timeout=self.timeout)
         finally:
             rs.close()
         if resp.status_code == 401 or resp.status_code == 403:
@@ -291,7 +249,7 @@ class GlmClient:
         res = payload.get("result") or {}
         if payload.get("status") == C.STATUS_TRANSIENT:
             raise GlmTransientRejection(resp.status_code,
-                                        f"refresh 被风控瞬时拒绝（已退避重试 {self.max_retries} 次）")
+                                        "refresh 被风控瞬时拒绝（本实现不做退避重试）；请稍后重跑")
         if payload.get("status") != 0 or not res.get("access_token"):
             raise GlmAuthError(f"refresh 失败: status={payload.get('status')} {payload.get('message')}")
         if res.get("is_guest"):
@@ -327,20 +285,24 @@ class GlmClient:
         """GET operation/detail?tag=available_models，返回 result 原样（含 models / default）。"""
         return self._json("GET", C.EP_MODELS, params={"tag": "available_models"})
 
-    # ── 会话列表 ──────────────────────────────────────────────
-    def list_conversations(self, page: int = 1, page_size: int = C.DEFAULT_PAGE_SIZE) -> dict:
-        """POST conversation/recent_list。返回 {has_more, conversation_list}（翻页是纯页码）。"""
+    # ── 会话列表（V14 对齐：内部翻页，对外一次返回完整列表）───
+    def list_conversations_page(self, page: int = 1,
+                                page_size: int = C.DEFAULT_PAGE_SIZE) -> dict:
+        """原始单页请求：POST conversation/recent_list，返回 {has_more, conversation_list}。
+
+        一般请用 :meth:`list_conversations`（自动翻页拿全量）；本方法仅供调试/对比。
+        """
         return self._json("POST", C.EP_CONV_LIST, body={"page": page, "page_size": page_size})
 
-    def iter_conversations(self, page_size: int = C.DEFAULT_PAGE_SIZE) -> Iterator[dict]:
-        """自动翻页，逐条 yield conversation_list 元素，直到 has_more=False。"""
+    def list_conversations(self) -> list[dict]:
+        """全部会话（内部按 page/page_size 翻页直到 has_more=False，调用方不感知分页）。"""
+        out: list[dict] = []
         page = 1
         while True:
-            res = self.list_conversations(page=page, page_size=page_size)
-            for conv in res.get("conversation_list") or []:
-                yield conv
+            res = self.list_conversations_page(page=page)
+            out.extend(res.get("conversation_list") or [])
             if not res.get("has_more"):
-                return
+                return out
             page += 1
 
     # ── 对话历史 ──────────────────────────────────────────────
@@ -357,6 +319,39 @@ class GlmClient:
         """
         params = {"conversation_id": conversation_id, "assistant_id": assistant_id, **extra}
         return self._json("GET", C.EP_CONV_MESSAGES, params=params)
+
+    def history_turns(self, conversation_id: str, assistant_id: str = C.DEFAULT_ASSISTANT,
+                      with_raw: bool = False, **extra) -> list[dict]:
+        """规范化的单会话历史（V9 对齐 Go 的 ParseHistory）：一问一答一条。
+
+        每条：{message_id, created_at, user, text, reasoning, images, status}
+        （with_raw=True 时另带 input/output 上游原样）。规范化规则与 SSE 聚合同源：
+        只取 text/code 桶做正文、think/tool_result 桶做思考、image 桶出图链。
+        """
+        res = self.history(conversation_id, assistant_id, **extra)
+        turns: list[dict] = []
+        for i, m in enumerate(res.get("messages") or []):
+            user = "".join(c.get("text", "") for c in (m.get("input") or {}).get("content") or []
+                           if c.get("type") == "text")
+            out = m.get("output") or {}
+            texts, thinks, images = [], [], []
+            for p in out.get("parts") or []:
+                for c in p.get("content") or []:
+                    t = c.get("type")
+                    if t in TEXT_TYPES:
+                        texts.append(str(c.get("text") or c.get("code") or ""))
+                    elif t in THINK_TYPES:
+                        thinks.append(str(c.get("think") or c.get("content") or ""))
+                    elif t == "image":
+                        images.extend(str(im["image_url"]) for im in c.get("image") or []
+                                      if im.get("image_url"))
+            turn = {"message_id": m.get("id") or f"#{i}", "created_at": m.get("create_time") or "",
+                    "user": user, "text": "".join(texts), "reasoning": "".join(thinks),
+                    "images": images, "status": out.get("status") or ""}
+            if with_raw:
+                turn["input"], turn["output"] = m.get("input"), out
+            turns.append(turn)
+        return turns
 
     def history_v2(self, conversation_id: str, assistant_id: str = C.DEFAULT_ASSISTANT,
                    page_size: int = C.DEFAULT_HISTORY_PAGE_SIZE, **extra) -> dict:
@@ -382,78 +377,6 @@ class GlmClient:
         if stream:
             return self._chat_stream(body)
         return self._chat_once(body)
-
-    def create_conversation(self, message: Any, assistant_id: str = C.DEFAULT_ASSISTANT, **opts) -> str:
-        """没有「创建会话」端点（PROTOCOL §3.4）：会话由首次发消息时服务端懒创建。
-
-        本方法即「发首条消息并返回首帧回传的 conversation_id」。
-        """
-        res = self.chat(assistant_id, message, conversation_id=None, stream=False,
-                        **opts)
-        if not res.get("conversation_id"):
-            raise GlmUpstreamError(0, "上游未返回 conversation_id（无法确认会话已创建）")
-        return res["conversation_id"]
-
-    def generate_image(self, message: Any, conversation_id: str | None = None,
-                       stream: bool = False, aspect_ratio: str = "1:1",
-                       style: str = "none", scene: str = "none", **opts):
-        """AI 画图：走普通对话通道，仅换 assistant_id 并带 cogview 参数（IDE 抓包 sid 781 实证）。
-
-        返回结构与 chat() 一致；生图时 ``text`` 里含 Markdown 图片链接（![](url)），
-        或从 ``parts`` 里取 ``image`` 项。成品图直链（sfile.chatglm.cn）无需签名可直接下载。
-
-        2026-10-15 复核：
-          * ``aspect_ratio`` 生效，实测映射 1:1→1024²、3:4→864×1152、4:3→1152×864、
-            9:16→720×1280、16:9→1280×720；**非法值静默降级为 1:1（不报错）**；
-          * ``style`` / ``scene`` **已失效**（传真实枚举也无效），仅作兼容透传；
-          * 参考图改图（智能编辑）不走本函数，见 ``docs/生图协议与实操.md``。
-        """
-        cogview = {"aspect_ratio": aspect_ratio, "style": style, "scene": scene}
-        opts.setdefault("extra_meta", {})
-        base_cogview = opts["extra_meta"].setdefault("cogview", {"rm_label_watermark": False})
-        base_cogview.update(cogview)
-        opts["extra_meta"]["cogview"] = base_cogview
-        return self.chat(C.ASSISTANT_DRAWING, message, conversation_id=conversation_id,
-                         stream=stream, **opts)
-
-    def edit_image(self, prompt: str, image_url: str, *, file_id: str = "",
-                   edit_type: str = C.EDIT_TYPE_INTELLIGENT, category: int = 1,
-                   rm_label_watermark: bool = True, title: str | None = None,
-                   if_plus_model: bool = False, aspect_ratio: str = "1:1",
-                   **extra) -> dict:
-        """参考图改图（智能编辑）：POST drawing-api/v1/image/reference。
-
-        ``image_url`` **必须是上游服务器能拉到的公网 URL**（自家 CDN / 境内图床 / ghproxy 中转均可）；
-        ``file_id`` 可留空（实测空串、旧 ID 都不影响）⇒ **不需要 chat_upload**。
-
-        返回 ``{image_url, conversation_id}``；产物直链无需签名，但会过期，建议立即下载。
-        注意：**输出比例强制跟随输入图**，``aspect_ratio`` 传值无效（实测 890×500 输入 + 传 1:1
-        → 输出 1760×992）⇒ 要正方形请先把参考图补白成 1:1。
-
-        ⚠️ **单图接口**：多图不支持（并列字段被上游静默忽略，分隔符拼接会被当成一个 URL 拒掉，
-        传数组直接 400）。要多角色同框，请**把多角色合并到同一张参考图**（如角色设定集），
-        再用 prompt 分块锚定各自特征；细节见 ``docs/生图协议与实操.md`` §3.7 / §3.8。
-
-        实测：内联 data URI 与境外不可达 URL 都会让上游报 status=500（拉不到图）；
-        拉不到图时上游 1~2s 就返回 status=10031「不支持该图片」，而正常出图要 17~22s。
-        """
-        body = {"image_url": image_url, "file_id": file_id, "type": edit_type,
-                "category": category, "conversation_id": "", "history_id": "",
-                "assistant_id": C.ASSISTANT_DRAWING, "prompt": prompt,
-                "if_plus_model": if_plus_model,
-                "title": title if title is not None else "【智能编辑】 " + prompt[:40],
-                "aspect_ratio": aspect_ratio, "rm_label_watermark": rm_label_watermark}
-        body.update(extra)
-        # 长请求（~17~22s）：用非流式超时（READ_TIMEOUT=60 够用）；该端点不限流，不走退避重试
-        resp = self._raw_request("POST", C.EP_IMAGE_REFERENCE, body=body)
-        try:
-            payload = resp.json()
-        except ValueError:
-            raise GlmUpstreamError(resp.status_code, "响应不是合法 JSON", resp.text[:300]) from None
-        if resp.status_code >= 400:
-            raise GlmUpstreamError(resp.status_code, str(payload.get("message") or "http error"),
-                                   resp.text[:300])
-        return unwrap(payload)
 
     def rename_conversation(self, conversation_id: str, title: str) -> None:
         """POST conversation/modify_title。"""
@@ -493,35 +416,39 @@ class GlmClient:
         ensure_finished(agg)  # 没有 finish 也没有 error ⇒ 截断，抛 GlmStreamTruncated
         return agg.as_result()
 
-    # ── 流式：原样透传 ────────────────────────────────────────
+    # ── 流式：原样透传 + 收尾校验（V8 对齐 Go：截断必须报错）──
     def _chat_stream(self, body: dict) -> Iterator[bytes]:
-        """逐块 yield 上游原始字节：不解析、不改写、不补 [DONE]。"""
+        """逐块 yield 上游原始字节：不解析、不改写、不补 [DONE]。
+
+        与 Go 对齐（V8）：流结束时校验收尾 —— 未见 finish/error 即抛 GlmStreamTruncated。
+        消费方提前 break 主动放弃时不会触发校验（等价于 Go 里调用方取消读取）。
+        """
+        buf = bytearray()
         with self._stream_response(body) as resp:
             for chunk in resp.iter_content(chunk_size=None):
                 if chunk:
                     yield chunk
+                    buf += chunk
+        agg = ChatAggregate()
+        for payload in iter_sse_data(buf.decode("utf-8", errors="replace").splitlines()):
+            if obj := parse_frame(payload):
+                agg.feed(obj)
+        ensure_finished(agg)
 
-    def _stream_response(self, body: dict, retries: int | None = None):
+    def _stream_response(self, body: dict):
         """建立 SSE 连接并返回 response 上下文。
 
-        ⚠️ 流式请求**必须不设 timeout**（AGENTS.md R35 实证：带超时会让长回答被掐断
-        且无终止帧）。requests 的默认 timeout 即为 None，这里显式写明以防误改。
-
-        风控瞬时拒绝（40012）同样会命中流式接口，但这里**只在建连阶段退避重试**：
-        一旦 SSE 已开始输出就绝不能重试，否则会重复计费 / 产生重复消息。
+        ⚠️ 流式请求**必须不设 timeout**（实证：带超时会让长回答被掐断且无终止帧）。
+        风控瞬时拒绝（40012）不做重试（V1），直接报错 —— SSE 一旦开始输出就绝不能重试，
+        否则会重复计费 / 产生重复消息。
         """
         self.ensure_token()
-        retries = self.max_retries if retries is None else retries
-        for attempt in range(retries + 1):
-            resp = self.session.post(
-                self._url(C.EP_CHAT), headers=self._headers(SSE_ACCEPT),
-                data=json.dumps(body).encode(), stream=True, timeout=None,  # ← 刻意不设超时
-            )
-            if attempt < retries and self._is_transient(resp):
-                resp.close()
-                time.sleep(self._backoff(attempt))
-                continue
-            break
+        headers = self._headers(SSE_ACCEPT)
+        headers["Content-Type"] = "application/json;charset=UTF-8"          # V4 对齐 Go
+        resp = self.session.post(
+            self._url(C.EP_CHAT), headers=headers,
+            data=json.dumps(body).encode(), stream=True, timeout=None,  # ← 刻意不设超时
+        )
         if resp.status_code >= 400:
             raw = resp.text[:300]
             resp.close()
@@ -532,8 +459,7 @@ class GlmClient:
             try:
                 if json.loads(raw).get("status") == C.STATUS_TRANSIENT:
                     raise GlmTransientRejection(
-                        resp.status_code,
-                        f"对话接口被风控瞬时拒绝（已退避重试 {retries} 次）：请稍后重试")
+                        resp.status_code, "对话接口被风控瞬时拒绝（本实现不做退避重试）：请稍后重试")
             except (ValueError, AttributeError):
                 pass
             raise GlmUpstreamError(resp.status_code, "对话接口返回错误", raw)

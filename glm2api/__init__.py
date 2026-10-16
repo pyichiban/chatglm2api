@@ -1,7 +1,8 @@
-"""chatglm2api —— 智谱清言（chatglm.cn）网页版私有接口的独立 Python 客户端。
+"""chatglm2api —— 智谱清言（chatglm.cn）私有接口的 Python 客户端（IDE 通道）。
 
-纯 API 层实现：不涉及登录流程逆向，凭据由用户从浏览器手工提供。
-能力范围见 README.md（含明确的「不做」清单与已知缺口）。
+定位：**Go 版兄弟仓库 chatglm-cli 的子集**，库形态（程序内嵌调用）；接口契约见
+``tests/fixtures/contract.json``（与 Go 仓逐字节一致的跨语言契约）。
+纯 API 层：不涉及登录流程逆向，凭据由用户从浏览器手工提供。
 """
 
 from .client import GlmClient

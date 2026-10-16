@@ -89,53 +89,48 @@ with GlmClient(load_credential("glm_credential.json")) as client:
 ```bash
 python -m glm2api user-info
 python -m glm2api models
-python -m glm2api conversations --all
+python -m glm2api conversations               # 完整列表（内部自动翻页）
 python -m glm2api chat "你好"                    # 非流式聚合
-python -m glm2api chat "你好" --stream           # 原样透传 SSE
-python -m glm2api history <conversation_id>
+python -m glm2api chat "你好" --stream           # 原样透传 SSE（结束时校验收尾）
+python -m glm2api history <conversation_id>       # 规范化一问一答（--raw 看上游原样）
 python -m glm2api rename <conversation_id> "新标题"
 python -m glm2api delete <conversation_id>       # 实际删除，谨慎
-python -m glm2api --proxy http://127.0.0.1:10809 user-info
 ```
 
 ---
 
-## 2. 能力边界
+## 2. 能力边界（2026-10-16 定稿：Python 是 Go 版 [chatglm-cli](https://github.com/pyichiban/chatglm-cli) 的**子集**）
 
 | 做 | 不做（明确排除） |
 |---|---|
 | 凭据解析 + 签名（`X-Sign` / `X-Nonce` / `X-Timestamp`） | ❌ 登录流程逆向（微信扫码 / CDP 抓 Cookie）——**用户手工提供凭据** |
-| 用户信息 / 模型列表 / 会话列表 / 会话生命周期 / 多轮对话 | ❌ 工具调用（tool_calls / XML 协议 / agent loop） |
-| 流式 SSE **原样透传** | ❌ `think` 与 `text` 的语义化分流（透传时不需要；聚合结果里两者分开返回） |
+| 用户信息 / 模型列表 / 会话完整列表（内部翻页）/ 会话生命周期 / 多轮对话 | ❌ 工具调用（tool_calls / XML 协议 / agent loop） |
+| 流式 SSE **原样透传**（结束时校验收尾，截断报错） | ❌ **生图 / 参考图改图 / 代理**（已移除：生图入口只在 Go 版 CLI；`edit_image` 基于 WEB 链路不可靠） |
 | 非流式：**缓存池**聚合 | ❌ 签到 / 每日积分 / 费率（**费率上游根本不存在**，见 PROTOCOL §3.2） |
 | 单账号 | ❌ 多账号池 / 粘性路由 / 冷却惩罚 |
+
+接口契约见 [`tests/fixtures/contract.json`](tests/fixtures/contract.json)（与 Go 仓逐字节一致，
+两边测试各自断言同一份契约；已知的有意差异只剩 CLI 能力面与 refresh 的 cookie jar，见契约 `known_divergences`）。
 
 ### API 面
 
 ```python
-client = GlmClient(credential, base=..., proxies=...)
+client = GlmClient(credential, base=...)
 
-client.user_info()                         # dict，含 member_info.left_score（单位「分」）
+client.user_info()                         # dict，含 member_info.left_score（单位「分」，原样返回不折算）
 client.left_score() -> float               # 余额便捷读法（访客无 member_info → 0.0）
 client.models()                            # available_models 原样
 
-client.list_conversations(page=1, page_size=20)
-client.iter_conversations()                # 自动翻页直到 has_more=False
+client.list_conversations()                # ✅ 完整列表：内部自动翻页直到 has_more=False
+client.list_conversations_page(page, page_size)  # 原始单页（调试用）
 
 client.chat(assistant_id, message, conversation_id=None, stream=False, **opts)
-client.generate_image(message, aspect_ratio="1:1", style="none", scene="none", **opts)
-                                           # AI 画图（走对话通道换 agent）；返回 text 里含 Markdown 图片链接
-                                           # ⚠️ style/scene 已失效；参考图改图见 docs/生图协议与实操.md
-client.edit_image(prompt, image_url, **opts)
-                                           # 参考图改图（智能编辑）→ {image_url, conversation_id}
-                                           # image_url 必须是**上游可达的公网 URL**（不需 chat_upload）；
-                                           # 输出比例强制跟随输入图（要正方形先补白）；**单图接口**，
-                                           # 多角色请合并到同一张参考图（见 docs/生图协议与实操.md §3.7/§3.8）
-client.create_conversation(message)        # ⚠️ 见下方「易错点 2」
+                                           # 首轮 conversation_id=None：服务端懒创建，ID 从首帧取回
 client.history(conversation_id, assistant_id, **extra)
                                            # ✅ 单会话历史 [实证 2026-10-16]：GET mainchat-api/conversation/messages
                                            # 升序全量、**无分页**（page_size/page 实测被忽略）；
                                            # ⚠️ assistant_id 必带且要与会话匹配，传错直接空 messages
+client.history_turns(conversation_id, with_raw=False)  # 规范化一问一答（与 Go ParseHistory 同契约）
 client.history_v2(conversation_id, ...)    # ❌ 老路子 page_messages_v2：实测始终返空 list，仅留作比对
 client.rename_conversation(conversation_id, title)
 client.conversation_title(conversation_id)
@@ -178,10 +173,9 @@ client.refresh()                           # 强制刷新
    主仓 `internal/glm/constants.go` 写的 `/chatglm/backend-api/assistant/conversation/delete`
    **与抓包实测不符**。本项目采用实测值。删单个也走 bulk（无单删端点）。
 
-2. **不存在「创建对话」端点。**
+2. **不存在「创建对话」端点，也没有 create 方法。**
    点「新对话」不发任何 create 请求；会话由**首次发消息时服务端懒创建**，真实 ID 从流首帧回传。
-   因此 `create_conversation()` 的实现是「发一条消息并返回首帧的 `conversation_id`」，
-   而不是编一个假端点。
+   要建会话就发首条消息（`chat(..., conversation_id=None)`），与 Go 版行为一致。
 
 3. **`messages` 只带当前这一条。**
    多轮上下文全靠 `conversation_id` 由服务端维护（对比抓包 sid 356/480，两者 `messages` 长度都是 1）。

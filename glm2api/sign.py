@@ -47,7 +47,8 @@ def build_headers(token: str = "", accept: str = "application/json, text/plain, 
     h = {
         # 基础（IDE Electron 客户端实测值）
         "Accept": accept,
-        "Accept-Encoding": "gzip, deflate, br, zstd",
+        # V3 对齐 Go/contract.json：只发 gzip, deflate（stdlib 可解），不发 br/zstd
+        "Accept-Encoding": "gzip, deflate",
         "Accept-Language": "zh-CN",
         "App-Name": APP_NAME,
         "Origin": "https://chatglm.cn",

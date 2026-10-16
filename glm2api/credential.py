@@ -16,6 +16,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .errors import GlmUpstreamError
 
@@ -63,8 +64,9 @@ class Credential:
     user_id: str = ""                # 与 JWT.uid 同源
     # 浏览器粘贴的额外 cookie 键值（如 ssxmod_itna），非必需；WAF 标记不要往里塞
     extra_cookies: dict[str, str] = field(default_factory=dict)
-    refer_991: str = ""            # 浏览器 JS 动态生成的 WAF 参数，从页面 URL query 复制
     source: str = ""                 # 加载来源（文件路径或 "env"），仅用于落盘与提示
+    origin: str = ""                 # 本次加载/上次落盘时的 refresh，写盘前做并发覆盖检测（与 Go 版对齐）
+    unknown: dict = field(default_factory=dict)  # 文件里本工具不认识的键，写回时原样保留（与 Python/Go 共用文件）
 
     # ── 派生字段 ──────────────────────────────────────────────
     @property
@@ -115,7 +117,7 @@ class Credential:
 
 
 def make_credential(*, refresh_token: str = "", access_token: str = "", device_id: str = "",
-                    user_id: str = "", cookie: str = "", refer_991: str = "") -> Credential:
+                    user_id: str = "", cookie: str = "") -> Credential:
     """从「整条 cookie + 零散字段」构造凭据对象。"""
     ck = parse_cookie(cookie) if cookie else {}
     cred = Credential(
@@ -127,10 +129,8 @@ def make_credential(*, refresh_token: str = "", access_token: str = "", device_i
         extra_cookies={k: v for k, v in ck.items()
                        if k not in COOKIE_KEYS + WAF_COOKIE_KEYS
                        and not k.startswith(WAF_COOKIE_PREFIXES)},
-        refer_991=os.environ.get("GLM_REFER_991", ""),
     )
     cred.absorb_jwt()
-    cred.refer_991 = refer_991 or os.environ.get("GLM_REFER_991", "")
     return cred
 
 
@@ -148,6 +148,7 @@ def load_credential(path: str | None = None, *, env: dict | None = None) -> Cred
     if path:
         cred = _load_file(path)
         cred.source = path
+        cred.origin = cred.refresh_token      # 记录本次刷新依据，写盘前比对（并发保护）
         # 文件缺字段时用 env 兜底
         cred.refresh_token = cred.refresh_token or env.get("GLM_REFRESH_TOKEN", "")
         cred.access_token = cred.access_token or env.get("GLM_ACCESS_TOKEN", "")
@@ -179,14 +180,18 @@ def _load_file(path: str) -> Credential:
         raise GlmUpstreamError(0, f"凭据文件为空: {path}")
     if raw.startswith("{"):
         d = json.loads(raw)
-        return make_credential(
+        cred = make_credential(
             refresh_token=d.get("refresh_token", ""),
             access_token=d.get("access_token", ""),
             device_id=d.get("device_id", ""),
             user_id=d.get("user_id", ""),
             cookie=d.get("cookie", ""),
-            refer_991=d.get("refer_991", ""),
         )
+        # 未知键原样保留（与 Go 版对齐 V5）：本工具不认识的数据（如其它工具写入的字段）不丢
+        for k, v in d.items():
+            if k not in ("refresh_token", "access_token", "device_id", "user_id", "cookie"):
+                cred.unknown[k] = v
+        return cred
     # 纯文本：整条 cookie 或裸 refresh token，两种都支持
     return make_credential(cookie=raw, refresh_token="" if "=" in raw else raw)
 
@@ -194,14 +199,31 @@ def _load_file(path: str) -> Credential:
 def save_credential(cred: Credential, path: str | None = None) -> str:
     """把凭据写回文件（原子替换）。
 
-    ⚠️ **refresh token 每次刷新都会轮换，必须落盘**（PROTOCOL §1.3 铁律 1 / AGENTS.md 不变量 19-20）。
+    ⚠️ **refresh token 每次刷新都可能轮换，必须落盘**（PROTOCOL §1.3 铁律 1）。
     不落盘 = 下次启动拿旧 refresh token，账号直接失效。
+
+    与 Go 版对齐（contract.json V5）：
+      * 文件里本工具不认识的键原样保留；
+      * 写前重读磁盘，若其 refresh_token 与本次刷新依据（cred.origin）不一致 ⇒ 拒绝覆盖
+        （说明别的进程已轮换，覆盖会让账号失效）。
     """
     path = path or cred.source
     if not path or path == "env":
         raise GlmUpstreamError(0, "凭据来源不是文件，无法落盘：请通过 GLM_CREDENTIAL_FILE 指定路径")
+    if cred.origin and os.path.exists(path):
+        try:
+            cur = json.loads(Path(path).read_text(encoding="utf-8"))
+            if cur.get("refresh_token") and cur["refresh_token"] != cred.origin:
+                raise GlmUpstreamError(0, f"凭据文件 {path} 已被其它进程轮换（refresh_token 与本次刷新依据不一致），"
+                                          f"放弃写回；请重跑命令")
+        except json.JSONDecodeError:
+            pass  # 磁盘内容损坏时按原逻辑原子覆盖
+    disk = cred.to_dict()
+    for k, v in cred.unknown.items():
+        disk.setdefault(k, v)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cred.to_dict(), f, ensure_ascii=False, indent=2)
+        json.dump(disk, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)  # 原子替换，避免写一半被杀导致凭据损坏
+    cred.origin = cred.refresh_token  # 已落盘的值成为新的比对基准
     return path

@@ -14,7 +14,7 @@ from glm2api import DEFAULT_ASSISTANT, GlmClient, load_credential
 def main(conversation_id: str | None = None) -> None:
     with GlmClient(load_credential()) as client:
         if not conversation_id:
-            convs = list(client.iter_conversations())
+            convs = client.list_conversations()
             print(f"共 {len(convs)} 个会话，前 5 个：")
             for c in convs[:5]:
                 print(f"  {c.get('conversation_id')}  {c.get('title')}")

@@ -252,40 +252,26 @@ def _client():
     return GlmClient(cred)
 
 
-def test_transient_40012_is_retried_then_succeeds(monkeypatch):
-    """40012 是瞬时拒绝：退避重试后必须拿到结果，而不是直接报错。"""
+def test_transient_40012_raises_immediately(monkeypatch):
+    """V1 对齐 Go（contract.json retry.enabled=false）：40012 不重试，直接抛可区分的
+    GlmTransientRejection，且只发一次请求（调用方自行决定是否重跑）。"""
+    from glm2api.errors import GlmTransientRejection
     client = _client()
     calls = []
 
     def fake_request(method, url, **kw):
         calls.append(1)
-        # 前两次瞬时拒绝，第三次成功（复现实测：退避到第 4 次成功）
-        if len(calls) < 3:
-            return _FakeResp(400, {"status": C.STATUS_TRANSIENT, "message": "bad request(40012)"})
-        return _FakeResp(200, {"status": 0, "result": {"ok": True}})
+        return _FakeResp(400, {"status": C.STATUS_TRANSIENT, "message": "bad request(40012)"})
 
     monkeypatch.setattr(client.session, "request", fake_request)
-    monkeypatch.setattr("glm2api.client.time.sleep", lambda *_: None)  # 不等真时间
-    assert client._json("POST", C.EP_CONV_LIST, body={"page": 1}) == {"ok": True}
-    assert len(calls) == 3
-    client.close()
-
-
-def test_transient_40012_exhausted_raises_distinct_error(monkeypatch):
-    """重试耗尽后必须抛可区分的 GlmTransientRejection（提示可稍后重试）。"""
-    from glm2api.errors import GlmTransientRejection
-    client = _client()
-    monkeypatch.setattr(client.session, "request",
-                        lambda *a, **k: _FakeResp(400, {"status": C.STATUS_TRANSIENT,
-                                                        "message": "bad request(40012)"}))
-    monkeypatch.setattr("glm2api.client.time.sleep", lambda *_: None)
-    with pytest.raises(GlmTransientRejection):
-        client._json("POST", C.EP_CONV_LIST, body={"page": 1}, retries=2)
+    with pytest.raises(GlmTransientRejection) as ei:
+        client._json("POST", C.EP_CONV_LIST, body={"page": 1})
+    assert len(calls) == 1 and "不做退避重试" in str(ei.value)
     client.close()
 
 
 def test_non_transient_error_not_retried(monkeypatch):
-    """普通业务错误不得触发重试（避免把「确定性失败」放大成 5 倍请求）。"""
+    """普通业务错误不重发（fail early，与 Go 对齐）。"""
     client = _client()
     calls = []
     monkeypatch.setattr(client.session, "request",
